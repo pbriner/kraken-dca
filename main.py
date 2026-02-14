@@ -244,14 +244,29 @@ class KrakenDCA:
     def show_banner(self):
         """Display startup banner"""
         banner = f"""
-{Colors.CYAN}{Colors.BOLD}╔═══════════════════════════════════════════════════════════╗
-║                                                           ║
-║              {Colors.MAGENTA}KRAKEN DCA - CRYPTO AUTOMATION{Colors.CYAN}              ║
-║                                                           ║
-║  {Colors.WHITE}Built by: {Colors.GREEN}Pascal Briner{Colors.CYAN}                                ║
-║  {Colors.WHITE}Donations: {Colors.YELLOW}bc1qf9xsdlnffq0hlupcask0lvm702zndk3hf3tns4{Colors.CYAN}  ║
-║                                                           ║
-╚═══════════════════════════════════════════════════════════╝{Colors.RESET}
+{Colors.CYAN}{Colors.BOLD}                            ___
+                         .-'   `'.
+                        /         \\
+                        |         ;
+                        |         |           ___.--,
+               _.._     |0) ~ (0) |    _.---'`__.-( (_.
+        __.--'`_.. '.__.\\    '--. \\_.-' ,.--'`     `""`
+       ( ,.--'`   ',__ /./;   ;, '.__.'`    __
+       _`) )  .---.__.' / |   |\\   \\__..--""  """--.,_
+      `---' .'.''-._.-'`_./  /\\ '.  \\ _.-~~~````~~~-._`-.__.'{Colors.RESET}
+{Colors.MAGENTA}            | |  .' _.-' |  |  \\  \\  '.               `~---`
+             \\ \\/ .'     \\  \\   '. '-._)
+              \\/ /        \\  \\    `=.__`~-.
+              / /\\         `) )    / / `"".`\\
+        , _.-'.'\\ \\        / /    ( (     / /
+         `--~`   ) )    .-'.'      '.'.  | (
+                (/`    ( (`          ) )  '-;
+                 `      '-;         (-'{Colors.RESET}
+
+{Colors.CYAN}{Colors.BOLD}    KRAKEN DCA - Automated Dollar Cost Averaging{Colors.RESET}
+    
+    {Colors.WHITE}Built by: {Colors.GREEN}Pascal Briner{Colors.RESET}
+    {Colors.WHITE}Donations: {Colors.YELLOW}bc1qf9xsdlnffq0hlupcask0lvm702zndk3hf3tns4{Colors.RESET}
 """
         print(banner)
     
@@ -374,8 +389,8 @@ class KrakenDCA:
         print(f"{Colors.BOLD}{'Crypto Amount':<20}{'Avg Buy Price':<20}{'Last Buy Price':<20}{'P/L %':<20}{Colors.RESET}")
         print(f"{'-'*80}")
         
-        # Table row
-        print(f"{total_amount:<20.8f}{avg_price:<20.2f}{last_price:<20.2f}{color}{pl_percent:<20.2f}%{Colors.RESET}")
+        # Table row - format percentage without extra spaces
+        print(f"{total_amount:<20.8f}{avg_price:<20.2f}{last_price:<20.2f}{color}{pl_percent:.2f}%{Colors.RESET}")
         
         print(f"\n{Colors.BOLD}{'Current Price':<20}{'Total Invested':<20}{'Current Value':<20}{'P/L Fiat':<20}{Colors.RESET}")
         print(f"{'-'*80}")
