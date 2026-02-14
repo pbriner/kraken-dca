@@ -290,7 +290,7 @@ class KrakenDCA:
         current_price = self.api.get_ticker(self.config.trading_pair)
         
         # Calculate cost per buy
-        cost_per_buy = self.crypto_amount * current_price
+        cost_per_buy = self.config.crypto_amount * current_price
         
         # Calculate number of buys remaining
         total_amount, _, _, total_spent = self.store.get_statistics(self.config.trading_pair)
