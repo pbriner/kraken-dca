@@ -286,18 +286,37 @@ class KrakenDCA:
         time_diff = next_deposit - now
         remaining_hours = time_diff.total_seconds() / 3600
         
-        # Get current price
+        # Get current price and available balance
         current_price = self.api.get_ticker(self.config.trading_pair)
+        balance = self.api.get_balance()
         
-        # Calculate cost per buy
+        # Get fiat currency from trading pair
+        pair = self.config.trading_pair
+        if pair.startswith('X'):
+            pair = pair[1:]
+        quote_currency = pair[-3:] if pair[-3:] in balance else pair[-4:]
+        if quote_currency.startswith('Z'):
+            quote_currency = quote_currency[1:]
+        
+        # Get available fiat balance
+        available_fiat = balance.get(quote_currency, 0.0)
+        if available_fiat <= 0:
+            print(f"{Colors.YELLOW}Warning: No {quote_currency} balance available{Colors.RESET}")
+            return 24.0, int(remaining_hours)
+        
+        # Calculate cost per buy using config crypto_amount
         cost_per_buy = self.config.crypto_amount * current_price
         
-        # Calculate number of buys remaining
-        total_amount, _, _, total_spent = self.store.get_statistics(self.config.trading_pair)
+        # Calculate how many buys we can afford with available fiat
+        max_buys = int(available_fiat / cost_per_buy)
         
-        # Simple DCA: divide remaining time by fixed intervals
-        # Aim for one buy per day on average
-        hours_between_buys = max(24, remaining_hours / max(1, int(remaining_hours / 24)))
+        if max_buys <= 0:
+            print(f"{Colors.YELLOW}Warning: Insufficient balance for buy (need {cost_per_buy:.2f} {quote_currency}){Colors.RESET}")
+            return 24.0, int(remaining_hours)
+        
+        # Calculate hours between buys to empty fiat by next deposit
+        # NO SAFETY LIMIT - fiat must be empty
+        hours_between_buys = remaining_hours / max_buys
         
         return hours_between_buys, int(remaining_hours)
     
@@ -309,6 +328,7 @@ class KrakenDCA:
             
             # Place order
             print(f"\n{Colors.BOLD}Executing buy order...{Colors.RESET}")
+            print(f"  Amount: {self.config.crypto_amount:.8f} BTC at {current_price:.2f} CHF")
             result = self.api.place_market_order(
                 self.config.trading_pair,
                 str(self.config.crypto_amount)
