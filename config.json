@@ -1,0 +1,7 @@
+{
+  "trading_pair": "XXBTZUSD",
+  "deposit_day": 1,
+  "api_key": "YOUR_KRAKEN_API_KEY_HERE",
+  "api_secret": "YOUR_KRAKEN_API_SECRET_HERE",
+  "crypto_amount": 0.0001
+}

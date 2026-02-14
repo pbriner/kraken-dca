@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  kraken-dca:
+    build: .
+    container_name: kraken-dca
+    restart: unless-stopped
+    volumes:
+      # Mount config and transactions to persist data
+      - ./config.json:/app/config.json
+      - ./transactions.json:/app/transactions.json
+    environment:
+      - TZ=UTC
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: false
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
