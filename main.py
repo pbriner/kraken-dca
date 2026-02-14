@@ -372,6 +372,16 @@ class KrakenDCA:
         print(f"  Deposit Day: {Colors.CYAN}{self.config.deposit_day}{Colors.RESET}")
         print(f"  Crypto Amount per Buy: {Colors.CYAN}{self.config.crypto_amount}{Colors.RESET}\n")
         
+        # Display existing portfolio if we have transactions
+        total_amount, _, _, _ = self.store.get_statistics(self.config.trading_pair)
+        if total_amount > 0:
+            print(f"{Colors.BOLD}Loading existing portfolio...{Colors.RESET}")
+            try:
+                current_price = self.api.get_ticker(self.config.trading_pair)
+                self.display_statistics(current_price)
+            except Exception as e:
+                print(f"{Colors.YELLOW}Warning: Could not fetch current price: {str(e)}{Colors.RESET}\n")
+        
         print(f"{Colors.GREEN}Application started successfully!{Colors.RESET}")
         print(f"{Colors.YELLOW}Press Ctrl+C to stop{Colors.RESET}\n")
         
