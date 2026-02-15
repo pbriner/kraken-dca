@@ -477,10 +477,22 @@ class KrakenDCA:
             while True:
                 next_buy_time, hours_until_buy, remaining_hours = self.calculate_next_buy()
                 
+                # Get current balance and calculate stats
+                current_price = self.api.get_ticker(self.config.trading_pair)
+                balance = self.api.get_balance()
+                fiat_currency = self.get_fiat_currency()
+                available_fiat = balance.get(fiat_currency, 0.0)
+                
+                # Calculate estimated buy actions
+                cost_per_buy = self.config.crypto_amount * current_price
+                estimated_buys = int(available_fiat / cost_per_buy) if cost_per_buy > 0 else 0
+                
                 # Format the next buy time with timezone
                 formatted_time = next_buy_time.strftime("%Y-%m-%d %H:%M:%S %Z")
                 
                 print(f"{Colors.BOLD}Next buy: {Colors.CYAN}{formatted_time}{Colors.RESET}")
+                print(f"Current fiat available: {Colors.CYAN}{available_fiat:.2f} {fiat_currency}{Colors.RESET}")
+                print(f"Estimated buy actions till deposit day: {Colors.CYAN}{estimated_buys}{Colors.RESET}")
                 print(f"Remaining hours until deposit day: {Colors.CYAN}{remaining_hours}{Colors.RESET}")
                 print(f"Waiting...\n")
                 
