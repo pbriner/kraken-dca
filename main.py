@@ -14,7 +14,7 @@ import base64
 import urllib.parse
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -165,6 +165,12 @@ class TransactionStore:
         self.transactions.append(transaction)
         self._save()
     
+    def get_transaction_count(self, trading_pair: str = None) -> int:
+        """Get total number of transactions, optionally filtered by trading pair"""
+        if trading_pair:
+            return len([tx for tx in self.transactions if tx['trading_pair'] == trading_pair])
+        return len(self.transactions)
+    
     def get_statistics(self, trading_pair: str) -> Tuple[float, float, float, float]:
         """Calculate statistics for trading pair
         Returns: (total_amount, avg_price, last_price, total_spent)
@@ -280,24 +286,64 @@ class KrakenDCA:
             print(f"{Colors.RED}✗ {str(e)}{Colors.RESET}")
             sys.exit(1)
     
-    def calculate_next_buy(self) -> Tuple[float, int]:
-        """Calculate hours until next buy
-        Returns: (hours_until_buy, remaining_hours_in_period)
+    def get_fiat_currency(self) -> str:
+        """Extract fiat currency from trading pair"""
+        pair = self.config.trading_pair
+        if pair.startswith('X'):
+            pair = pair[1:]
+        quote_currency = pair[-3:]
+        if quote_currency.startswith('Z'):
+            quote_currency = quote_currency[1:]
+        return quote_currency
+    
+    def calculate_next_buy(self) -> Tuple[datetime, float, int]:
+        """Calculate next buy time (at 8 AM on deposit day)
+        Returns: (next_buy_datetime, hours_until_buy, remaining_hours_in_period)
         """
-        now = datetime.now()
+        now = datetime.now().astimezone()
         current_day = now.day
         
-        # Calculate next deposit day
+        # Calculate next deposit day at 8 AM
         if current_day < self.config.deposit_day:
-            next_deposit = now.replace(day=self.config.deposit_day)
+            # This month at 8 AM
+            next_deposit = now.replace(
+                day=self.config.deposit_day,
+                hour=8,
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+        elif current_day == self.config.deposit_day and now.hour < 8:
+            # Today at 8 AM (if before 8 AM)
+            next_deposit = now.replace(
+                hour=8,
+                minute=0,
+                second=0,
+                microsecond=0
+            )
         else:
-            # Next month
+            # Next month at 8 AM
             if now.month == 12:
-                next_deposit = now.replace(year=now.year + 1, month=1, day=self.config.deposit_day)
+                next_deposit = now.replace(
+                    year=now.year + 1,
+                    month=1,
+                    day=self.config.deposit_day,
+                    hour=8,
+                    minute=0,
+                    second=0,
+                    microsecond=0
+                )
             else:
-                next_deposit = now.replace(month=now.month + 1, day=self.config.deposit_day)
+                next_deposit = now.replace(
+                    month=now.month + 1,
+                    day=self.config.deposit_day,
+                    hour=8,
+                    minute=0,
+                    second=0,
+                    microsecond=0
+                )
         
-        # Calculate remaining hours
+        # Calculate remaining hours until next deposit
         time_diff = next_deposit - now
         remaining_hours = time_diff.total_seconds() / 3600
         
@@ -305,19 +351,14 @@ class KrakenDCA:
         current_price = self.api.get_ticker(self.config.trading_pair)
         balance = self.api.get_balance()
         
-        # Get fiat currency from trading pair
-        pair = self.config.trading_pair
-        if pair.startswith('X'):
-            pair = pair[1:]
-        quote_currency = pair[-3:] if pair[-3:] in balance else pair[-4:]
-        if quote_currency.startswith('Z'):
-            quote_currency = quote_currency[1:]
+        # Get fiat currency
+        quote_currency = self.get_fiat_currency()
         
         # Get available fiat balance
         available_fiat = balance.get(quote_currency, 0.0)
         if available_fiat <= 0:
             print(f"{Colors.YELLOW}Warning: No {quote_currency} balance available{Colors.RESET}")
-            return 24.0, int(remaining_hours)
+            return next_deposit, 24.0, int(remaining_hours)
         
         # Calculate cost per buy using config crypto_amount
         cost_per_buy = self.config.crypto_amount * current_price
@@ -327,13 +368,15 @@ class KrakenDCA:
         
         if max_buys <= 0:
             print(f"{Colors.YELLOW}Warning: Insufficient balance for buy (need {cost_per_buy:.2f} {quote_currency}){Colors.RESET}")
-            return 24.0, int(remaining_hours)
+            return next_deposit, 24.0, int(remaining_hours)
         
         # Calculate hours between buys to empty fiat by next deposit
-        # NO SAFETY LIMIT - fiat must be empty
         hours_between_buys = remaining_hours / max_buys
         
-        return hours_between_buys, int(remaining_hours)
+        # Calculate actual next buy time
+        next_buy_time = now + timedelta(hours=hours_between_buys)
+        
+        return next_buy_time, hours_between_buys, int(remaining_hours)
     
     def execute_buy(self):
         """Execute a buy order"""
@@ -341,9 +384,12 @@ class KrakenDCA:
             # Get current price
             current_price = self.api.get_ticker(self.config.trading_pair)
             
+            # Get next order number
+            order_number = self.store.get_transaction_count(self.config.trading_pair) + 1
+            
             # Place order
-            print(f"\n{Colors.BOLD}Executing buy order...{Colors.RESET}")
-            print(f"  Amount: {self.config.crypto_amount:.8f} BTC at {current_price:.2f} CHF")
+            print(f"\n{Colors.BOLD}Executing buy order #{order_number}...{Colors.RESET}")
+            print(f"  Amount: {self.config.crypto_amount:.8f} BTC at {current_price:.2f} {self.get_fiat_currency()}")
             result = self.api.place_market_order(
                 self.config.trading_pair,
                 str(self.config.crypto_amount)
@@ -373,6 +419,9 @@ class KrakenDCA:
         if total_amount == 0:
             return
         
+        # Get fiat currency
+        fiat_currency = self.get_fiat_currency()
+        
         # Calculate P/L
         current_value = total_amount * current_price
         pl_fiat = current_value - total_spent
@@ -381,21 +430,25 @@ class KrakenDCA:
         # Determine color
         color = Colors.GREEN if pl_fiat >= 0 else Colors.RED
         
-        print(f"\n{Colors.BOLD}{'='*80}{Colors.RESET}")
-        print(f"{Colors.BOLD}{'PORTFOLIO SUMMARY':<80}{Colors.RESET}")
-        print(f"{Colors.BOLD}{'='*80}{Colors.RESET}")
+        print(f"\n{Colors.BOLD}{'='*110}{Colors.RESET}")
+        print(f"{Colors.BOLD}{'PORTFOLIO SUMMARY':<110}{Colors.RESET}")
+        print(f"{Colors.BOLD}{'='*110}{Colors.RESET}")
         
-        # Table header
-        print(f"{Colors.BOLD}{'Crypto Amount':<20}{'Avg Buy Price':<20}{'Last Buy Price':<20}{'P/L %':<20}{Colors.RESET}")
-        print(f"{'-'*80}")
+        # Table header - First row with fixed column widths
+        print(f"{Colors.BOLD}{'Crypto Amount':<30}{'Avg Buy Price (' + fiat_currency + ')':<30}{'Last Buy Price (' + fiat_currency + ')':<30}{'P/L %':<20}{Colors.RESET}")
+        print(f"{'-'*110}")
         
-        # Table row - format percentage without extra spaces
-        print(f"{total_amount:<20.8f}{avg_price:<20.2f}{last_price:<20.2f}{color}{pl_percent:.2f}%{Colors.RESET}")
+        # Table data - First row with matching column widths
+        pl_percent_str = f"{pl_percent:.2f}%"
+        print(f"{total_amount:<30.8f}{avg_price:<30.2f}{last_price:<30.2f}{color}{pl_percent_str:<20}{Colors.RESET}")
         
-        print(f"\n{Colors.BOLD}{'Current Price':<20}{'Total Invested':<20}{'Current Value':<20}{'P/L Fiat':<20}{Colors.RESET}")
-        print(f"{'-'*80}")
-        print(f"{current_price:<20.2f}{total_spent:<20.2f}{current_value:<20.2f}{color}{pl_fiat:<20.2f}{Colors.RESET}")
-        print(f"{Colors.BOLD}{'='*80}{Colors.RESET}\n")
+        # Table header - Second row with fixed column widths
+        print(f"\n{Colors.BOLD}{'Current Price (' + fiat_currency + ')':<30}{'Total Invested (' + fiat_currency + ')':<30}{'Current Value (' + fiat_currency + ')':<30}{'P/L Fiat (' + fiat_currency + ')':<20}{Colors.RESET}")
+        print(f"{'-'*110}")
+        
+        # Table data - Second row with matching column widths
+        print(f"{current_price:<30.2f}{total_spent:<30.2f}{current_value:<30.2f}{color}{pl_fiat:<20.2f}{Colors.RESET}")
+        print(f"{Colors.BOLD}{'='*110}{Colors.RESET}\n")
     
     def run(self):
         """Main application loop"""
@@ -404,7 +457,7 @@ class KrakenDCA:
         
         print(f"{Colors.BOLD}Configuration:{Colors.RESET}")
         print(f"  Trading Pair: {Colors.CYAN}{self.config.trading_pair}{Colors.RESET}")
-        print(f"  Deposit Day: {Colors.CYAN}{self.config.deposit_day}{Colors.RESET}")
+        print(f"  Deposit Day: {Colors.CYAN}{self.config.deposit_day} at 8:00 AM{Colors.RESET}")
         print(f"  Crypto Amount per Buy: {Colors.CYAN}{self.config.crypto_amount}{Colors.RESET}\n")
         
         # Display existing portfolio if we have transactions
@@ -422,9 +475,12 @@ class KrakenDCA:
         
         try:
             while True:
-                hours_until_buy, remaining_hours = self.calculate_next_buy()
+                next_buy_time, hours_until_buy, remaining_hours = self.calculate_next_buy()
                 
-                print(f"{Colors.BOLD}Next buy in: {Colors.CYAN}{hours_until_buy:.2f} hours{Colors.RESET}")
+                # Format the next buy time with timezone
+                formatted_time = next_buy_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+                
+                print(f"{Colors.BOLD}Next buy: {Colors.CYAN}{formatted_time}{Colors.RESET}")
                 print(f"Remaining hours until deposit day: {Colors.CYAN}{remaining_hours}{Colors.RESET}")
                 print(f"Waiting...\n")
                 
