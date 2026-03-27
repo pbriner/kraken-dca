@@ -9,6 +9,8 @@ services:
       # Mount config and transactions to persist data
       - ./config.json:/app/config.json
       - ./transactions.json:/app/transactions.json
+    env_file:
+      - .env
     environment:
       - TZ=UTC
     # Security options

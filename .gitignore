@@ -35,6 +35,7 @@ env/
 .DS_Store
 
 # Sensitive files - IMPORTANT!
+.env
 # Uncomment these if you want to keep credentials out of git
 # config.json
 # transactions.json

@@ -78,8 +78,8 @@ Common Kraken pairs:
 ### 3. Build and Run
 
 ```bash
-# Build the Docker image
-docker-compose build
+# Build the Docker image (use --no-cache for a clean build)
+docker-compose build --no-cache
 
 # Start the application
 docker-compose up -d

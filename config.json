@@ -1,7 +1,9 @@
 {
   "trading_pair": "XXBTZUSD",
   "deposit_day": 1,
-  "api_key": "YOUR_KRAKEN_API_KEY_HERE",
-  "api_secret": "YOUR_KRAKEN_API_SECRET_HERE",
-  "crypto_amount": 0.0001
+  "crypto_amount": 0.0001,
+  "dip_threshold_percent": 5.0,
+  "poll_interval_seconds": 300,
+  "buy_hour": 8,
+  "dip_buy_cooldown_hours": 24.0
 }

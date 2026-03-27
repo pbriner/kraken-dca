@@ -54,43 +54,50 @@ class KrakenAPI:
         )
         return base64.b64encode(signature.digest()).decode()
     
-    def _api_request(self, endpoint: str, data: Optional[Dict] = None, 
-                     private: bool = False) -> Dict:
-        """Make API request to Kraken"""
-        url = f"{self.API_URL}{endpoint}"
-        
-        if private:
-            if data is None:
-                data = {}
-            nonce = str(int(time.time() * 1000))
-            data['nonce'] = nonce
-            
-            headers = {
-                'API-Key': self.api_key,
-                'API-Sign': self._get_kraken_signature(endpoint, data, nonce),
-                'Content-Type': 'application/x-www-form-urlencoded'
-            }
-            postdata = urllib.parse.urlencode(data).encode('utf-8')
-            req = urllib.request.Request(url, data=postdata, headers=headers)
-        else:
-            if data:
-                postdata = urllib.parse.urlencode(data).encode('utf-8')
-                req = urllib.request.Request(url, data=postdata)
+    def _api_request(self, endpoint: str, data: Optional[Dict] = None,
+                     private: bool = False, max_retries: int = 3) -> Dict:
+        """Make API request to Kraken with automatic retry on transient failures"""
+        for attempt in range(max_retries):
+            url = f"{self.API_URL}{endpoint}"
+            req_data = dict(data) if data else {}
+
+            if private:
+                nonce = str(int(time.time() * 1000))
+                req_data['nonce'] = nonce
+
+                headers = {
+                    'API-Key': self.api_key,
+                    'API-Sign': self._get_kraken_signature(endpoint, req_data, nonce),
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+                postdata = urllib.parse.urlencode(req_data).encode('utf-8')
+                req = urllib.request.Request(url, data=postdata, headers=headers)
             else:
-                req = urllib.request.Request(url)
-        
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                
-                if result.get('error') and len(result['error']) > 0:
-                    raise Exception(f"Kraken API Error: {', '.join(result['error'])}")
-                
-                return result.get('result', {})
-        except urllib.error.HTTPError as e:
-            raise Exception(f"HTTP Error {e.code}: {e.reason}")
-        except urllib.error.URLError as e:
-            raise Exception(f"Connection Error: {e.reason}")
+                if req_data:
+                    postdata = urllib.parse.urlencode(req_data).encode('utf-8')
+                    req = urllib.request.Request(url, data=postdata)
+                else:
+                    req = urllib.request.Request(url)
+
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+
+                    if result.get('error') and len(result['error']) > 0:
+                        raise Exception(f"Kraken API Error: {', '.join(result['error'])}")
+
+                    return result.get('result', {})
+            except Exception as e:
+                is_last_attempt = attempt == max_retries - 1
+                if is_last_attempt:
+                    if isinstance(e, urllib.error.HTTPError):
+                        raise Exception(f"HTTP Error {e.code}: {e.reason}")
+                    elif isinstance(e, urllib.error.URLError):
+                        raise Exception(f"Connection Error: {e.reason}")
+                    raise
+                wait = 5 * (2 ** attempt)
+                print(f"API request failed (attempt {attempt + 1}/{max_retries}), retrying in {wait}s: {e}")
+                time.sleep(wait)
     
     def test_connection(self) -> bool:
         """Test API connection and credentials"""
@@ -198,6 +205,10 @@ class Config:
         self.api_key: str = ''
         self.api_secret: str = ''
         self.crypto_amount: float = 0.0
+        self.dip_threshold_percent: float = 5.0
+        self.poll_interval_seconds: int = 600
+        self.buy_hour: int = 8
+        self.dip_buy_cooldown_hours: float = 24.0
         self._load()
     
     def _load(self):
@@ -212,19 +223,31 @@ class Config:
         # Load and validate
         self.trading_pair = config.get('trading_pair', '').upper()
         self.deposit_day = int(config.get('deposit_day', 1))
-        self.api_key = config.get('api_key', '')
-        self.api_secret = config.get('api_secret', '')
+        self.api_key = os.environ.get('KRAKEN_API_KEY') or config.get('api_key', '')
+        self.api_secret = os.environ.get('KRAKEN_API_SECRET') or config.get('api_secret', '')
         self.crypto_amount = float(config.get('crypto_amount', 0.0))
-        
+        self.dip_threshold_percent = float(config.get('dip_threshold_percent', 5.0))
+        self.poll_interval_seconds = int(config.get('poll_interval_seconds', 600))
+        self.buy_hour = int(config.get('buy_hour', 8))
+        self.dip_buy_cooldown_hours = float(config.get('dip_buy_cooldown_hours', 24.0))
+
         # Validation
         if not self.trading_pair:
             raise Exception("trading_pair is required in config")
         if not (1 <= self.deposit_day <= 28):
-            raise Exception("deposit_day must be between 1 and 28")
+            raise Exception("deposit_day must be between 1 and 28 (limited to 28 to ensure validity in February)")
         if not self.api_key or not self.api_secret:
             raise Exception("api_key and api_secret are required")
         if self.crypto_amount <= 0:
             raise Exception("crypto_amount must be greater than 0")
+        if not (0 < self.dip_threshold_percent <= 100):
+            raise Exception("dip_threshold_percent must be between 0 and 100")
+        if self.poll_interval_seconds < 60:
+            raise Exception("poll_interval_seconds must be at least 60")
+        if not (0 <= self.buy_hour <= 23):
+            raise Exception("buy_hour must be between 0 and 23")
+        if self.dip_buy_cooldown_hours < 0:
+            raise Exception("dip_buy_cooldown_hours must be 0 or greater")
     
     def _create_template(self):
         """Create template configuration file"""
@@ -233,7 +256,11 @@ class Config:
             "deposit_day": 1,
             "api_key": "YOUR_API_KEY_HERE",
             "api_secret": "YOUR_API_SECRET_HERE",
-            "crypto_amount": 0.0001
+            "crypto_amount": 0.0001,
+            "dip_threshold_percent": 5.0,
+            "poll_interval_seconds": 600,
+            "buy_hour": 8,
+            "dip_buy_cooldown_hours": 24.0
         }
         with open(self.config_path, 'w') as f:
             json.dump(template, f, indent=2)
@@ -295,40 +322,44 @@ class KrakenDCA:
         if quote_currency.startswith('Z'):
             quote_currency = quote_currency[1:]
         return quote_currency
+
+    def get_fiat_balance(self, balance: Dict) -> float:
+        """Get fiat balance, handling Kraken's Z-prefix format"""
+        currency = self.get_fiat_currency()
+        return balance.get(f'Z{currency}', balance.get(currency, 0.0))
     
     def calculate_next_buy(self) -> Tuple[datetime, float, int]:
-        """Calculate next buy time (at 8 AM on deposit day)
+        """Calculate next buy time (at configured buy_hour on deposit day)
         Returns: (next_buy_datetime, hours_until_buy, remaining_hours_in_period)
         """
         now = datetime.now().astimezone()
         current_day = now.day
-        
-        # Calculate next deposit day at 8 AM
+        buy_hour = self.config.buy_hour
+
+        # Calculate next deposit day at configured buy hour
         if current_day < self.config.deposit_day:
-            # This month at 8 AM
             next_deposit = now.replace(
                 day=self.config.deposit_day,
-                hour=8,
+                hour=buy_hour,
                 minute=0,
                 second=0,
                 microsecond=0
             )
-        elif current_day == self.config.deposit_day and now.hour < 8:
-            # Today at 8 AM (if before 8 AM)
+        elif current_day == self.config.deposit_day and now.hour < buy_hour:
             next_deposit = now.replace(
-                hour=8,
+                hour=buy_hour,
                 minute=0,
                 second=0,
                 microsecond=0
             )
         else:
-            # Next month at 8 AM
+            # Next month
             if now.month == 12:
                 next_deposit = now.replace(
                     year=now.year + 1,
                     month=1,
                     day=self.config.deposit_day,
-                    hour=8,
+                    hour=buy_hour,
                     minute=0,
                     second=0,
                     microsecond=0
@@ -337,7 +368,7 @@ class KrakenDCA:
                 next_deposit = now.replace(
                     month=now.month + 1,
                     day=self.config.deposit_day,
-                    hour=8,
+                    hour=buy_hour,
                     minute=0,
                     second=0,
                     microsecond=0
@@ -355,7 +386,7 @@ class KrakenDCA:
         quote_currency = self.get_fiat_currency()
         
         # Get available fiat balance
-        available_fiat = balance.get(quote_currency, 0.0)
+        available_fiat = self.get_fiat_balance(balance)
         if available_fiat <= 0:
             print(f"{Colors.YELLOW}Warning: No {quote_currency} balance available{Colors.RESET}")
             return next_deposit, 24.0, int(remaining_hours)
@@ -457,8 +488,11 @@ class KrakenDCA:
         
         print(f"{Colors.BOLD}Configuration:{Colors.RESET}")
         print(f"  Trading Pair: {Colors.CYAN}{self.config.trading_pair}{Colors.RESET}")
-        print(f"  Deposit Day: {Colors.CYAN}{self.config.deposit_day} at 8:00 AM{Colors.RESET}")
-        print(f"  Crypto Amount per Buy: {Colors.CYAN}{self.config.crypto_amount}{Colors.RESET}\n")
+        print(f"  Deposit Day: {Colors.CYAN}{self.config.deposit_day} at {self.config.buy_hour}:00{Colors.RESET}")
+        print(f"  Crypto Amount per Buy: {Colors.CYAN}{self.config.crypto_amount}{Colors.RESET}")
+        print(f"  Dip Threshold: {Colors.CYAN}{self.config.dip_threshold_percent}%{Colors.RESET}")
+        print(f"  Dip Buy Cooldown: {Colors.CYAN}{self.config.dip_buy_cooldown_hours}h{Colors.RESET}")
+        print(f"  Poll Interval: {Colors.CYAN}{self.config.poll_interval_seconds}s{Colors.RESET}\n")
         
         # Display existing portfolio if we have transactions
         total_amount, _, _, _ = self.store.get_statistics(self.config.trading_pair)
@@ -472,35 +506,105 @@ class KrakenDCA:
         
         print(f"{Colors.GREEN}Application started successfully!{Colors.RESET}")
         print(f"{Colors.YELLOW}Press Ctrl+C to stop{Colors.RESET}\n")
-        
+
         try:
+            # Execute a buy immediately on startup
+            self.execute_buy()
+            last_dip_buy_time = None
+
             while True:
                 next_buy_time, hours_until_buy, remaining_hours = self.calculate_next_buy()
-                
+
                 # Get current balance and calculate stats
                 current_price = self.api.get_ticker(self.config.trading_pair)
                 balance = self.api.get_balance()
                 fiat_currency = self.get_fiat_currency()
-                available_fiat = balance.get(fiat_currency, 0.0)
-                
+                available_fiat = self.get_fiat_balance(balance)
+
                 # Calculate estimated buy actions
                 cost_per_buy = self.config.crypto_amount * current_price
                 estimated_buys = int(available_fiat / cost_per_buy) if cost_per_buy > 0 else 0
-                
+
+                # Get last buy price for dip detection
+                _, _, last_buy_price, _ = self.store.get_statistics(self.config.trading_pair)
+                dip_factor = 1.0 - (self.config.dip_threshold_percent / 100.0)
+                dip_threshold = last_buy_price * dip_factor if last_buy_price > 0 else 0
+
                 # Format the next buy time with timezone
                 formatted_time = next_buy_time.strftime("%Y-%m-%d %H:%M:%S %Z")
-                
-                print(f"{Colors.BOLD}Next buy: {Colors.CYAN}{formatted_time}{Colors.RESET}")
+                poll_minutes = self.config.poll_interval_seconds // 60
+
+                print(f"{Colors.BOLD}Next scheduled buy: {Colors.CYAN}{formatted_time}{Colors.RESET}")
+                print(f"Current price: {Colors.CYAN}{current_price:.2f} {fiat_currency}{Colors.RESET}")
+                print(f"Dip buy threshold ({self.config.dip_threshold_percent}%): {Colors.CYAN}{dip_threshold:.2f} {fiat_currency}{Colors.RESET}")
+                print(f"Dip buy cooldown: {Colors.CYAN}{self.config.dip_buy_cooldown_hours}h{Colors.RESET}")
                 print(f"Current fiat available: {Colors.CYAN}{available_fiat:.2f} {fiat_currency}{Colors.RESET}")
                 print(f"Estimated buy actions till deposit day: {Colors.CYAN}{estimated_buys}{Colors.RESET}")
                 print(f"Remaining hours until deposit day: {Colors.CYAN}{remaining_hours}{Colors.RESET}")
-                print(f"Waiting...\n")
-                
-                # Convert hours to seconds and wait
-                time.sleep(hours_until_buy * 3600)
-                
-                # Execute buy
-                self.execute_buy()
+                print(f"Monitoring every {poll_minutes} minutes...\n")
+
+                # Track balance for deposit detection
+                previous_fiat = available_fiat
+
+                # Poll until next buy time
+                while True:
+                    time.sleep(self.config.poll_interval_seconds)
+
+                    now = datetime.now().astimezone()
+
+                    # Check if it's time for the scheduled buy
+                    if now >= next_buy_time:
+                        print(f"{Colors.BOLD}Scheduled buy time reached.{Colors.RESET}")
+                        self.execute_buy()
+                        break
+
+                    try:
+                        current_price = self.api.get_ticker(self.config.trading_pair)
+                        balance = self.api.get_balance()
+                        available_fiat = self.get_fiat_balance(balance)
+
+                        # Dip detection: buy if price dropped below threshold
+                        _, _, last_buy_price, _ = self.store.get_statistics(self.config.trading_pair)
+                        dip_factor = 1.0 - (self.config.dip_threshold_percent / 100.0)
+                        dip_threshold = last_buy_price * dip_factor if last_buy_price > 0 else 0
+
+                        if dip_threshold > 0 and current_price <= dip_threshold:
+                            cooldown_ok = (
+                                last_dip_buy_time is None or
+                                (now - last_dip_buy_time).total_seconds() / 3600 >= self.config.dip_buy_cooldown_hours
+                            )
+                            if cooldown_ok:
+                                print(f"\n{Colors.MAGENTA}{Colors.BOLD}DIP DETECTED!{Colors.RESET} "
+                                      f"Price {current_price:.2f} is ≥{self.config.dip_threshold_percent}% below last buy price {last_buy_price:.2f}")
+                                self.execute_buy()
+                                last_dip_buy_time = now
+                                # Recalculate schedule after dip buy
+                                next_buy_time, hours_until_buy, remaining_hours = self.calculate_next_buy()
+                                formatted_time = next_buy_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+                                print(f"{Colors.BOLD}Recalculated next buy: {Colors.CYAN}{formatted_time}{Colors.RESET}\n")
+                            else:
+                                remaining_cooldown = self.config.dip_buy_cooldown_hours - (now - last_dip_buy_time).total_seconds() / 3600
+                                print(f"[{now.strftime('%H:%M:%S')}] Dip detected but cooldown active ({remaining_cooldown:.1f}h remaining)")
+
+                        # Deposit detection: new fiat arrived
+                        if available_fiat > previous_fiat:
+                            deposit_amount = available_fiat - previous_fiat
+                            print(f"\n{Colors.GREEN}{Colors.BOLD}NEW DEPOSIT DETECTED!{Colors.RESET} "
+                                  f"+{deposit_amount:.2f} {fiat_currency} "
+                                  f"(balance: {available_fiat:.2f} {fiat_currency})")
+                            previous_fiat = available_fiat
+                            # Recalculate schedule with new balance
+                            next_buy_time, hours_until_buy, remaining_hours = self.calculate_next_buy()
+                            formatted_time = next_buy_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+                            print(f"{Colors.BOLD}Recalculated next buy: {Colors.CYAN}{formatted_time}{Colors.RESET}\n")
+
+                        print(f"[{now.strftime('%H:%M:%S')}] Price: {current_price:.2f} | "
+                              f"Dip at: {dip_threshold:.2f} | "
+                              f"Balance: {available_fiat:.2f} {fiat_currency}")
+                        self.display_statistics(current_price)
+
+                    except Exception as e:
+                        print(f"{Colors.YELLOW}Warning: Check cycle error: {str(e)}{Colors.RESET}")
                 
         except KeyboardInterrupt:
             print(f"\n\n{Colors.YELLOW}Application stopped by user{Colors.RESET}")
