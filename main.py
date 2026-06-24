@@ -194,12 +194,29 @@ class TransactionStore:
         
         return total_amount, avg_price, last_price, total_spent
 
+    def get_monthly_spent(self, trading_pair: str, deposit_day: int, buy_hour: int = 0) -> float:
+        now = datetime.now()
+        cycle_started = now.day > deposit_day or (now.day == deposit_day and now.hour >= buy_hour)
+        if cycle_started:
+            period_start = now.replace(day=deposit_day, hour=buy_hour, minute=0, second=0, microsecond=0)
+        else:
+            first_of_month = now.replace(day=1)
+            prev_month = first_of_month - timedelta(days=1)
+            period_start = prev_month.replace(day=deposit_day, hour=buy_hour, minute=0, second=0, microsecond=0)
+        pair_txs = [
+            tx for tx in self.transactions
+            if tx['trading_pair'] == trading_pair
+            and datetime.fromisoformat(tx['date']) >= period_start
+        ]
+        return sum(tx['amount'] * tx['price'] for tx in pair_txs)
+
 
 class Config:
     """Configuration loader and validator"""
     
     def __init__(self, config_path: str = 'config.json'):
         self.config_path = Path(config_path)
+        self.mode: str = 'recurring'
         self.trading_pair: str = ''
         self.deposit_day: int = 1
         self.api_key: str = ''
@@ -209,6 +226,9 @@ class Config:
         self.poll_interval_seconds: int = 600
         self.buy_hour: int = 8
         self.dip_buy_cooldown_hours: float = 24.0
+        self.max_price: Optional[float] = None
+        self.max_monthly_amount: Optional[float] = None
+        self.dca_end_date: Optional[datetime] = None
         self._load()
     
     def _load(self):
@@ -221,6 +241,7 @@ class Config:
             config = json.load(f)
         
         # Load and validate
+        self.mode = config.get('mode', 'recurring').lower()
         self.trading_pair = config.get('trading_pair', '').upper()
         self.deposit_day = int(config.get('deposit_day', 1))
         self.api_key = os.environ.get('KRAKEN_API_KEY') or config.get('api_key', '')
@@ -230,12 +251,25 @@ class Config:
         self.poll_interval_seconds = int(config.get('poll_interval_seconds', 600))
         self.buy_hour = int(config.get('buy_hour', 8))
         self.dip_buy_cooldown_hours = float(config.get('dip_buy_cooldown_hours', 24.0))
+        max_price_raw = config.get('max_price')
+        self.max_price = float(max_price_raw) if max_price_raw is not None else None
+        max_monthly_raw = config.get('max_monthly_amount')
+        self.max_monthly_amount = float(max_monthly_raw) if max_monthly_raw is not None else None
+        dca_end_raw = config.get('dca_end_date')
+        self.dca_end_date = datetime.fromisoformat(dca_end_raw).astimezone() if dca_end_raw else None
 
         # Validation
+        if self.mode not in ('recurring', 'lump_sum'):
+            raise Exception("mode must be 'recurring' or 'lump_sum'")
         if not self.trading_pair:
             raise Exception("trading_pair is required in config")
-        if not (1 <= self.deposit_day <= 28):
+        if self.mode == 'recurring' and not (1 <= self.deposit_day <= 28):
             raise Exception("deposit_day must be between 1 and 28 (limited to 28 to ensure validity in February)")
+        if self.mode == 'lump_sum':
+            if self.dca_end_date is None:
+                raise Exception("dca_end_date is required when mode is 'lump_sum' (e.g. \"2027-06-01\")")
+            if self.dca_end_date <= datetime.now().astimezone():
+                raise Exception("dca_end_date must be in the future")
         if not self.api_key or not self.api_secret:
             raise Exception("api_key and api_secret are required")
         if self.crypto_amount <= 0:
@@ -329,91 +363,72 @@ class KrakenDCA:
         return balance.get(f'Z{currency}', balance.get(currency, 0.0))
     
     def calculate_next_buy(self) -> Tuple[datetime, float, int]:
-        """Calculate next buy time (at configured buy_hour on deposit day)
+        """Calculate next buy time based on mode.
         Returns: (next_buy_datetime, hours_until_buy, remaining_hours_in_period)
         """
         now = datetime.now().astimezone()
-        current_day = now.day
         buy_hour = self.config.buy_hour
 
-        # Calculate next deposit day at configured buy hour
-        if current_day < self.config.deposit_day:
-            next_deposit = now.replace(
-                day=self.config.deposit_day,
-                hour=buy_hour,
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-        elif current_day == self.config.deposit_day and now.hour < buy_hour:
-            next_deposit = now.replace(
-                hour=buy_hour,
-                minute=0,
-                second=0,
-                microsecond=0
-            )
+        if self.config.mode == 'lump_sum':
+            period_end = self.config.dca_end_date
+            if now >= period_end:
+                print(f"{Colors.YELLOW}DCA end date reached ({period_end.strftime('%Y-%m-%d')}), no more scheduled buys.{Colors.RESET}")
+                return period_end, 0.0, 0
+            remaining_hours = (period_end - now).total_seconds() / 3600
         else:
-            # Next month
-            if now.month == 12:
-                next_deposit = now.replace(
-                    year=now.year + 1,
-                    month=1,
-                    day=self.config.deposit_day,
-                    hour=buy_hour,
-                    minute=0,
-                    second=0,
-                    microsecond=0
-                )
+            current_day = now.day
+            if current_day < self.config.deposit_day:
+                period_end = now.replace(day=self.config.deposit_day, hour=buy_hour, minute=0, second=0, microsecond=0)
+            elif current_day == self.config.deposit_day and now.hour < buy_hour:
+                period_end = now.replace(hour=buy_hour, minute=0, second=0, microsecond=0)
+            elif now.month == 12:
+                period_end = now.replace(year=now.year + 1, month=1, day=self.config.deposit_day, hour=buy_hour, minute=0, second=0, microsecond=0)
             else:
-                next_deposit = now.replace(
-                    month=now.month + 1,
-                    day=self.config.deposit_day,
-                    hour=buy_hour,
-                    minute=0,
-                    second=0,
-                    microsecond=0
-                )
-        
-        # Calculate remaining hours until next deposit
-        time_diff = next_deposit - now
-        remaining_hours = time_diff.total_seconds() / 3600
-        
+                period_end = now.replace(month=now.month + 1, day=self.config.deposit_day, hour=buy_hour, minute=0, second=0, microsecond=0)
+            remaining_hours = (period_end - now).total_seconds() / 3600
+
         # Get current price and available balance
         current_price = self.api.get_ticker(self.config.trading_pair)
         balance = self.api.get_balance()
-        
-        # Get fiat currency
         quote_currency = self.get_fiat_currency()
-        
-        # Get available fiat balance
         available_fiat = self.get_fiat_balance(balance)
+
         if available_fiat <= 0:
             print(f"{Colors.YELLOW}Warning: No {quote_currency} balance available{Colors.RESET}")
-            return next_deposit, 24.0, int(remaining_hours)
-        
-        # Calculate cost per buy using config crypto_amount
+            return period_end, 24.0, int(remaining_hours)
+
         cost_per_buy = self.config.crypto_amount * current_price
-        
-        # Calculate how many buys we can afford with available fiat
         max_buys = int(available_fiat / cost_per_buy)
-        
+
         if max_buys <= 0:
             print(f"{Colors.YELLOW}Warning: Insufficient balance for buy (need {cost_per_buy:.2f} {quote_currency}){Colors.RESET}")
-            return next_deposit, 24.0, int(remaining_hours)
-        
-        # Calculate hours between buys to empty fiat by next deposit
+            return period_end, 24.0, int(remaining_hours)
+
         hours_between_buys = remaining_hours / max_buys
-        
-        # Calculate actual next buy time
         next_buy_time = now + timedelta(hours=hours_between_buys)
-        
+
         return next_buy_time, hours_between_buys, int(remaining_hours)
     
     def execute_buy(self):
         """Execute a buy order"""
         try:
+            if self.config.mode == 'lump_sum' and datetime.now().astimezone() >= self.config.dca_end_date:
+                print(f"{Colors.YELLOW}⚠ Buy skipped: DCA end date {self.config.dca_end_date.strftime('%Y-%m-%d')} has been reached{Colors.RESET}")
+                return
+
             # Get current price
             current_price = self.api.get_ticker(self.config.trading_pair)
+
+            if self.config.max_price is not None and current_price > self.config.max_price:
+                print(f"{Colors.YELLOW}⚠ Buy skipped: price {current_price:.2f} is above max_price {self.config.max_price:.2f}{Colors.RESET}")
+                return
+
+            if self.config.max_monthly_amount is not None:
+                monthly_spent = self.store.get_monthly_spent(self.config.trading_pair, self.config.deposit_day, self.config.buy_hour)
+                buy_cost = self.config.crypto_amount * current_price
+                if monthly_spent + buy_cost > self.config.max_monthly_amount:
+                    print(f"{Colors.YELLOW}⚠ Buy skipped: monthly spend {monthly_spent:.2f} + {buy_cost:.2f} would exceed limit {self.config.max_monthly_amount:.2f}{Colors.RESET}")
+                    return
             
             # Get next order number
             order_number = self.store.get_transaction_count(self.config.trading_pair) + 1
@@ -441,44 +456,78 @@ class KrakenDCA:
         except Exception as e:
             print(f"{Colors.RED}✗ Error executing buy: {str(e)}{Colors.RESET}")
     
-    def display_statistics(self, current_price: float):
+    def display_statistics(self, current_price: float, next_buy_time: Optional[datetime] = None):
         """Display trading statistics in table format"""
         total_amount, avg_price, last_price, total_spent = self.store.get_statistics(
             self.config.trading_pair
         )
-        
+
         if total_amount == 0:
             return
-        
+
         # Get fiat currency
         fiat_currency = self.get_fiat_currency()
-        
+
         # Calculate P/L
         current_value = total_amount * current_price
         pl_fiat = current_value - total_spent
         pl_percent = (pl_fiat / total_spent * 100) if total_spent > 0 else 0
-        
+
         # Determine color
         color = Colors.GREEN if pl_fiat >= 0 else Colors.RED
-        
+
+        if self.config.mode == 'lump_sum':
+            days_total = max(1, (self.config.dca_end_date - datetime.now().astimezone()).days)
+            mode_line = f"Mode: Lump Sum  |  DCA End Date: {self.config.dca_end_date.strftime('%Y-%m-%d')}  |  {days_total}d remaining"
+        else:
+            mode_line = f"Mode: Recurring  |  Deposit Day: {self.config.deposit_day}  |  Buy Hour: {self.config.buy_hour:02d}:00"
+
         print(f"\n{Colors.BOLD}{'='*110}{Colors.RESET}")
         print(f"{Colors.BOLD}{'PORTFOLIO SUMMARY':<110}{Colors.RESET}")
+        print(f"{Colors.CYAN}{mode_line:<110}{Colors.RESET}")
         print(f"{Colors.BOLD}{'='*110}{Colors.RESET}")
-        
+
         # Table header - First row with fixed column widths
         print(f"{Colors.BOLD}{'Crypto Amount':<30}{'Avg Buy Price (' + fiat_currency + ')':<30}{'Last Buy Price (' + fiat_currency + ')':<30}{'P/L %':<20}{Colors.RESET}")
         print(f"{'-'*110}")
-        
+
         # Table data - First row with matching column widths
         pl_percent_str = f"{pl_percent:.2f}%"
         print(f"{total_amount:<30.8f}{avg_price:<30.2f}{last_price:<30.2f}{color}{pl_percent_str:<20}{Colors.RESET}")
-        
+
         # Table header - Second row with fixed column widths
         print(f"\n{Colors.BOLD}{'Current Price (' + fiat_currency + ')':<30}{'Total Invested (' + fiat_currency + ')':<30}{'Current Value (' + fiat_currency + ')':<30}{'P/L Fiat (' + fiat_currency + ')':<20}{Colors.RESET}")
         print(f"{'-'*110}")
-        
+
         # Table data - Second row with matching column widths
         print(f"{current_price:<30.2f}{total_spent:<30.2f}{current_value:<30.2f}{color}{pl_fiat:<20.2f}{Colors.RESET}")
+
+        # Table header - Third row: spend info and end condition
+        max_price_str = f"{self.config.max_price:.2f}" if self.config.max_price else "disabled"
+        if self.config.mode == 'lump_sum':
+            days_left = max(0, (self.config.dca_end_date - datetime.now().astimezone()).days)
+            end_date_str = f"{self.config.dca_end_date.strftime('%Y-%m-%d')} ({days_left}d left)"
+            print(f"\n{Colors.BOLD}{'DCA End Date':<55}{'Max Buy Price (' + fiat_currency + ')':<55}{Colors.RESET}")
+            print(f"{'-'*110}")
+            print(f"{Colors.CYAN}{end_date_str:<55}{max_price_str:<55}{Colors.RESET}")
+        else:
+            monthly_spent = self.store.get_monthly_spent(self.config.trading_pair, self.config.deposit_day, self.config.buy_hour)
+            cycle_spent_str = f"{monthly_spent:.2f}"
+            if self.config.max_monthly_amount is not None:
+                cycle_spent_str += f" / {self.config.max_monthly_amount:.2f}"
+            print(f"\n{Colors.BOLD}{'Cycle Spent (' + fiat_currency + ')':<55}{'Max Buy Price (' + fiat_currency + ')':<55}{Colors.RESET}")
+            print(f"{'-'*110}")
+            print(f"{Colors.CYAN}{cycle_spent_str:<55}{max_price_str:<55}{Colors.RESET}")
+
+        # Table header - Fourth row: next buy schedule
+        if next_buy_time is not None:
+            now = datetime.now().astimezone()
+            hours_until_buy = max(0.0, (next_buy_time - now).total_seconds() / 3600)
+            formatted_next_buy = next_buy_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+            print(f"\n{Colors.BOLD}{'Next Scheduled Buy':<55}{'Hours Until Next Buy':<55}{Colors.RESET}")
+            print(f"{'-'*110}")
+            print(f"{Colors.CYAN}{formatted_next_buy:<55}{hours_until_buy:<55.1f}{Colors.RESET}")
+
         print(f"{Colors.BOLD}{'='*110}{Colors.RESET}\n")
     
     def run(self):
@@ -487,11 +536,17 @@ class KrakenDCA:
         self.test_connection()
         
         print(f"{Colors.BOLD}Configuration:{Colors.RESET}")
+        print(f"  Mode: {Colors.CYAN}{'Lump Sum' if self.config.mode == 'lump_sum' else 'Recurring'}{Colors.RESET}")
         print(f"  Trading Pair: {Colors.CYAN}{self.config.trading_pair}{Colors.RESET}")
-        print(f"  Deposit Day: {Colors.CYAN}{self.config.deposit_day} at {self.config.buy_hour}:00{Colors.RESET}")
+        if self.config.mode == 'lump_sum':
+            print(f"  DCA End Date: {Colors.CYAN}{self.config.dca_end_date.strftime('%Y-%m-%d')}{Colors.RESET}")
+        else:
+            print(f"  Deposit Day: {Colors.CYAN}{self.config.deposit_day} at {self.config.buy_hour}:00{Colors.RESET}")
         print(f"  Crypto Amount per Buy: {Colors.CYAN}{self.config.crypto_amount}{Colors.RESET}")
         print(f"  Dip Threshold: {Colors.CYAN}{self.config.dip_threshold_percent}%{Colors.RESET}")
         print(f"  Dip Buy Cooldown: {Colors.CYAN}{self.config.dip_buy_cooldown_hours}h{Colors.RESET}")
+        print(f"  Max Price: {Colors.CYAN}{self.config.max_price:.2f} {self.get_fiat_currency()}{Colors.RESET}" if self.config.max_price else f"  Max Price: {Colors.CYAN}disabled{Colors.RESET}")
+        print(f"  Max Monthly: {Colors.CYAN}{self.config.max_monthly_amount:.2f} {self.get_fiat_currency()}{Colors.RESET}" if self.config.max_monthly_amount else f"  Max Monthly: {Colors.CYAN}disabled{Colors.RESET}")
         print(f"  Poll Interval: {Colors.CYAN}{self.config.poll_interval_seconds}s{Colors.RESET}\n")
         
         # Display existing portfolio if we have transactions
@@ -500,7 +555,8 @@ class KrakenDCA:
             print(f"{Colors.BOLD}Loading existing portfolio...{Colors.RESET}")
             try:
                 current_price = self.api.get_ticker(self.config.trading_pair)
-                self.display_statistics(current_price)
+                next_buy_preview, _, _ = self.calculate_next_buy()
+                self.display_statistics(current_price, next_buy_preview)
             except Exception as e:
                 print(f"{Colors.YELLOW}Warning: Could not fetch current price: {str(e)}{Colors.RESET}\n")
         
@@ -601,7 +657,7 @@ class KrakenDCA:
                         print(f"[{now.strftime('%H:%M:%S')}] Price: {current_price:.2f} | "
                               f"Dip at: {dip_threshold:.2f} | "
                               f"Balance: {available_fiat:.2f} {fiat_currency}")
-                        self.display_statistics(current_price)
+                        self.display_statistics(current_price, next_buy_time)
 
                     except Exception as e:
                         print(f"{Colors.YELLOW}Warning: Check cycle error: {str(e)}{Colors.RESET}")

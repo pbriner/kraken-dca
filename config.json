@@ -1,9 +1,31 @@
 {
-  "trading_pair": "XXBTZUSD",
-  "deposit_day": 1,
+  "_docs": {
+    "_readme": "All fields are documented here. Remove api_key and api_secret from this file — pass them via KRAKEN_API_KEY and KRAKEN_API_SECRET environment variables instead.",
+    "mode": "DCA strategy: 'recurring' (default) or 'lump_sum'. See _mode_guide below.",
+    "_mode_guide": {
+      "recurring": "Monthly DCA. A fixed fiat amount is deposited each month on deposit_day. The bot spreads buys evenly between each deposit. Use this when you add money regularly.",
+      "lump_sum": "One-time chunk. You deposit a large amount once and the bot spreads buys evenly until dca_end_date. Use this when you want to DCA a fixed sum over a bear market or defined window. Set deposit_day to any value — it is unused in this mode."
+    },
+    "dca_end_date": "Required when mode is 'lump_sum'. ISO date string (YYYY-MM-DD) marking the last day buys are allowed. The bot spaces buys evenly between now and this date using the available fiat balance. Must be in the future.",
+    "trading_pair": "Kraken asset pair to trade, e.g. XBTCHF (BTC/CHF) or XXBTZUSD (BTC/USD).",
+    "deposit_day": "Day of the month the scheduled buy runs (1-28). Defines the cycle boundary for recurring mode and for max_monthly_amount tracking. Unused in lump_sum mode.",
+    "buy_hour": "Hour of the day (0-23) at which the scheduled buy executes on deposit_day (recurring) or startup (lump_sum).",
+    "crypto_amount": "Amount of crypto to buy per order (in BTC). Each scheduled and dip buy uses this amount. Minimum on Kraken: 0.0001 BTC.",
+    "dip_threshold_percent": "How far the price must drop below the last buy price to trigger an extra dip buy (e.g. 5 = 5%). Set high to reduce noise.",
+    "dip_buy_cooldown_hours": "Minimum hours between two consecutive dip buys, to avoid over-buying during a crash.",
+    "poll_interval_seconds": "How often the bot checks prices and conditions, in seconds (minimum 60).",
+    "max_price": "Skip any buy if the current price is above this value (in fiat). Useful to avoid buying at ATH. Set to null to disable.",
+    "max_monthly_amount": "Maximum fiat to spend per period (deposit_day to deposit_day in recurring, or per calendar month in lump_sum). Set to null to disable."
+  },
+   "mode": "recurring",
+  "dca_end_date": null,
+  "trading_pair": "XBTCHF",
+  "deposit_day": 24,
   "crypto_amount": 0.0001,
   "dip_threshold_percent": 5.0,
   "poll_interval_seconds": 300,
   "buy_hour": 8,
-  "dip_buy_cooldown_hours": 24.0
+  "dip_buy_cooldown_hours": 2.0,
+  "max_price": 65000,
+  "max_monthly_amount": 10000
 }
