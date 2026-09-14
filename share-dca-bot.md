@@ -14,6 +14,8 @@ Runs a continuous Dollar Cost Averaging loop against the Kraken exchange in one 
 
 Both modes share: dip buying, max price guard, max monthly spend cap, deposit detection, and portfolio summary.
 
+Optionally, a Telegram bot runs alongside the trading loop in a background thread: `/status` reports current holdings, average price, last/next buy, and mode; `/buy` places an immediate confirm-gated manual buy for the exchange minimum; `/chart` (or `/chart price`) sends a chart of BTC held and price over time. Every executed buy also sends an automatic notification, regardless of which command (if any) triggered it.
+
 ---
 
 ## Kraken account setup
@@ -57,13 +59,14 @@ Kraken enforces a minimum volume per order. For BTC the minimum is **0.0001 BTC*
 ## Tech stack
 
 - **Language:** Python 3.11
-- **Dependencies:** zero third-party packages — stdlib only (`urllib`, `hmac`, `hashlib`, `json`, `datetime`, etc.)
+- **Dependencies:** zero third-party Python packages — stdlib only (`urllib`, `hmac`, `hashlib`, `json`, `datetime`, `threading`, etc.). The one deliberate exception to "no external services" is `/chart`, which points Telegram at a QuickChart.io URL instead of rendering images locally — this adds no package dependency, just an optional outbound call
 - **Persistence:** single `transactions.json` file, appended on every buy
+- **Concurrency:** main thread runs the trading loop; a daemon thread runs the Telegram long-poll loop (only started if `telegram_bot_token` is configured)
 - **Deployment:** Docker + Docker Compose, non-root user, all Linux capabilities dropped
 
 ---
 
-## Architecture — 4 classes
+## Architecture — 5 classes
 
 ### `KrakenAPI`
 
@@ -101,6 +104,24 @@ XXBTZUSD → strip X → XBTZUSD → last 3 → USD → strip Z → USD
 
 ---
 
+### `TelegramBot`
+
+Minimal Telegram Bot API client, `urllib`-only, same "no HTTP library" philosophy as `KrakenAPI`. Talks to `https://api.telegram.org/bot{token}/{method}` with JSON POST bodies.
+
+**Methods:**
+| Method | Telegram API | Purpose |
+|--------|--------------|---------|
+| `get_updates(offset, poll_timeout)` | `getUpdates` | Long-poll for new messages/button presses (30s timeout) |
+| `send_message(chat_id, text, reply_markup=None)` | `sendMessage` | Send a message, optionally with an inline keyboard. Always `parse_mode='HTML'` |
+| `send_photo(chat_id, photo_url, caption=None)` | `sendPhoto` | Send an image by URL — Telegram's servers fetch it, the bot never downloads or hosts the image itself. Used by `/chart` |
+| `answer_callback_query(id, text=None)` | `answerCallbackQuery` | Acknowledge a button press (stops the client-side loading spinner) |
+| `edit_message_reply_markup(chat_id, message_id, reply_markup=None)` | `editMessageReplyMarkup` | Strip a message's buttons after it's been acted on |
+| `set_my_commands(commands)` | `setMyCommands` | Register the `/` command menu shown natively in the Telegram client |
+
+No polling state lives in this class — the offset (which update to resume from) is tracked by the caller (`KrakenDCA.telegram_loop`).
+
+---
+
 ### `TransactionStore`
 
 Simple JSON list stored in `transactions.json`. Each entry:
@@ -117,8 +138,9 @@ Simple JSON list stored in `transactions.json`. Each entry:
 **Never rotates.** The file grows indefinitely (one entry per buy). For a weekly DCA bot this stays tiny for years.
 
 **Key methods:**
-- `add_transaction` — appends and rewrites the whole file (small file, safe)
+- `add_transaction` — appends and rewrites the whole file (small file, safe). Guarded by a `threading.Lock` since a Telegram-triggered manual buy can now race with the scheduled-buy thread
 - `get_statistics(pair)` → `(total_amount, avg_price, last_price, total_spent)`
+- `get_last_transaction(pair)` → most recent transaction dict or `None` (used for Telegram `/status`'s last-buy date/price)
 - `get_monthly_spent(pair, deposit_day, buy_hour)` — sums fiat spent since the cycle boundary
 
 **Cycle boundary logic** (used for both modes' `max_monthly_amount` tracking):
@@ -153,8 +175,10 @@ Loads from `config.json`. **Credentials come exclusively from environment variab
 | `poll_interval_seconds` | int ≥ 60 | yes | How often the inner loop checks price/balance |
 | `max_price` | float or null | no | Skip any buy if price is above this value |
 | `max_monthly_amount` | float or null | no | Skip buy if cycle spend + this buy would exceed limit |
+| `telegram_bot_token` | string | no | Enables the Telegram thread if non-empty. Prefer `TELEGRAM_BOT_TOKEN` env var over storing in the JSON file |
+| `telegram_chat_id` | string | no | The only chat the bot will respond to with real data. Prefer `TELEGRAM_CHAT_ID` env var. If empty, the bot only ever replies with the sender's chat ID (onboarding), never portfolio data |
 
-Validation runs on load; startup fails fast with a descriptive error if invalid. `dca_end_date` must be in the future when mode is `lump_sum`.
+Validation runs on load; startup fails fast with a descriptive error if invalid. `dca_end_date` must be in the future when mode is `lump_sum`. Telegram fields are unvalidated/optional — their absence simply disables the feature (`self.telegram = None`).
 
 ---
 
@@ -165,9 +189,10 @@ startup
 ├── show_banner
 ├── test_connection (exits on failure)
 ├── print config summary (shows mode, end date or deposit day)
+├── if telegram_bot_token set → spawn daemon thread: telegram_loop()
 ├── display existing portfolio (if transactions exist)
 ├── execute_buy()            ← immediate buy on startup
-└── outer loop (forever)
+└── outer loop (forever, main thread)
     ├── calculate_next_buy() → next_buy_time, hours_between_buys, remaining_hours
     ├── print status summary
     └── inner polling loop
@@ -175,7 +200,19 @@ startup
         ├── if now >= next_buy_time → execute_buy(), break to outer loop
         ├── dip detection → execute_buy() if triggered, recalculate schedule
         └── deposit detection → recalculate schedule if balance increased
+
+telegram_loop() (background daemon thread, runs concurrently with the above)
+├── set_my_commands([/status, /buy, /chart, /help])   ← registers the '/' menu in Telegram clients
+└── forever
+    ├── get_updates(offset)                    ← long-poll, 30s timeout
+    └── for each update:
+        ├── message present  → handle_telegram_message()
+        └── callback_query present → handle_telegram_callback()  (inline button press)
 ```
+
+**`execute_buy()` (scheduled/dip) and `execute_manual_buy()` (Telegram `/buy`) both delegate order placement to a shared `_place_buy(amount, price, label)` helper** — order submission, transaction recording, and the portfolio-summary print are not duplicated between the two paths.
+
+Because the Telegram thread can trigger a buy at the same moment the main thread does, both `execute_buy` and `execute_manual_buy` wrap their check-and-place section in a shared `self._buy_lock` (a `threading.Lock`). Without it, two concurrent buys could both pass the `max_monthly_amount` check before either recorded its transaction, exceeding the configured cap.
 
 **Schedule calculation (`calculate_next_buy`) — mode branch:**
 
@@ -240,6 +277,87 @@ P/L is green when positive, red when negative.
 
 ---
 
+## Telegram integration
+
+Enabled only if `telegram_bot_token` (or the `TELEGRAM_BOT_TOKEN` env var) is set. Disabled entirely otherwise — `self.telegram` stays `None` and no thread starts.
+
+### Authorization model
+
+`telegram_chat_id` is the single allowlisted chat. Handled in `handle_telegram_message` / `handle_telegram_callback`:
+
+```python
+if not self.config.telegram_chat_id:
+    # onboarding: reply with the sender's chat_id only, no portfolio data, no buy capability
+    send_message(chat_id, f"Your chat ID is: {chat_id}. Add it to config.json to authorize.")
+    return
+if str(chat_id) != self.config.telegram_chat_id:
+    send_message(chat_id, "Unauthorized.")
+    return
+```
+
+This means the bot is safe to leave with an empty `telegram_chat_id` while you find your ID — it never leaks data to an unauthorized sender, it only ever discloses the sender's own chat ID (needed to fill in the config).
+
+### Commands
+
+| Command | Behavior |
+|---------|----------|
+| `/start`, `/help` | Lists available commands |
+| `/status` | Builds and sends `build_telegram_status()`: mode, BTC amount, average buy price, last buy date + price, next buy time, current price, P/L% |
+| `/buy` | Fetches current price, shows it plus estimated cost, and sends an inline keyboard: `✅ Confirm buy {MIN_BUY_BTC} BTC` / `❌ Cancel` |
+| `/chart` | Sends a photo from `build_chart_url()`: cumulative BTC held (left axis) + daily average price + overall average buy price (right axis), aggregated per day |
+| `/chart price` | Same as `/chart` but `mode='price'` — omits the BTC-held dataset and left axis entirely, single-axis price-only chart |
+
+### Automatic buy notifications
+
+Every successful buy — scheduled, dip, or manual — triggers a Telegram message, not just `/buy`. `_place_buy()` (the single order-placement path shared by `execute_buy()` and `execute_manual_buy()`) calls `_notify_buy(order_number, amount, price, label)` after recording the transaction:
+
+```python
+def _notify_buy(self, order_number, amount, price, label):
+    if not (self.telegram and self.config.telegram_chat_id):
+        return  # Telegram not configured, or chat_id not yet authorized — no-op
+    try:
+        self.telegram.send_message(self.config.telegram_chat_id, f"✅ {label.capitalize()} #{order_number}\n...")
+    except Exception:
+        pass  # best-effort — a Telegram failure must never break the buy that already executed
+```
+
+`label` is threaded through from the call site so the notification reads correctly: `execute_buy(reason="scheduled")` (default) or `execute_buy(reason="dip")` from the dip-detection branch, and `"manual buy"` from `execute_manual_buy`. Because this fires from inside `_place_buy`, `execute_manual_buy` no longer sends its own separate "bought" confirmation — that would double-notify the same buy.
+
+### Chart rendering (`build_chart_url`)
+
+No local charting library — the bot builds a Chart.js config as a dict, JSON-encodes and URL-encodes it, and points a [QuickChart.io](https://quickchart.io) URL at it. Telegram's `sendPhoto` accepts that URL directly; Telegram's own servers fetch the image, not the bot.
+
+Key details:
+- **Aggregated per calendar day**, not per transaction — with hundreds of dip/scheduled buys, a per-transaction chart would be both unreadable and produce a URL too long to be reliable. Grouping by `tx['date'][:10]` keeps both the image and the URL manageable (tested at ~3.7KB URL for 916 real transactions).
+- **Downsampling**: if aggregated days exceed `max_points` (default 60), an even stride selects a subset of indices (always including the last day) so old history doesn't make the chart unreadable either.
+- **`mode='full'`** (default): three datasets — `BTC Held` (filled area, left axis `y`), `Daily Avg Price` (right axis `y1`), `Overall Avg Buy Price` (flat dashed reference line on `y1`, from `store.get_statistics()`'s cost-basis average — distinct from the fluctuating daily average).
+- **`mode='price'`**: drops the `BTC Held` dataset and the left axis entirely; both price datasets move to the single remaining axis `y`.
+- Uses Chart.js v2-style option keys (`yAxes` array, `scaleLabel`, `gridLines`) since that's QuickChart's default rendering version — v3-style `scales.y`/`scales.y1` objects will not render correctly.
+
+### `/buy` confirmation flow (`handle_telegram_callback`)
+
+A single tap can't fire a real order — `/buy` only *shows* a button; a separate button press is required to execute:
+
+```
+user sends /buy
+  → bot fetches current price, replies with price/cost + inline [Confirm] [Cancel]
+user taps a button → Telegram sends a callback_query update
+  → handle_telegram_callback:
+      1. verify chat_id against telegram_chat_id (same allowlist as messages)
+      2. edit_message_reply_markup(chat_id, message_id)   ← strip the buttons immediately,
+                                                              so a double-tap can't fire twice
+      3. if data == 'buy_confirm': answer_callback_query(...) then execute_manual_buy(chat_id)
+      4. if data == 'buy_cancel':  answer_callback_query(...) then send "Buy cancelled."
+```
+
+`execute_manual_buy` always buys `KrakenDCA.MIN_BUY_BTC` (0.0001 BTC — Kraken's minimum), not `config.crypto_amount`. It still checks `max_price` and `max_monthly_amount` before placing the order — the button skips the *schedule*, not the safety guards.
+
+### Registering commands with Telegram's native menu
+
+`telegram_loop()` calls `set_my_commands()` once at startup so `/status`, `/buy`, `/chart`, `/help` show up with descriptions when the user taps the `/` icon in Telegram, instead of relying on them remembering command names.
+
+---
+
 ## Config file format
 
 `config.json` uses a `_docs` key for inline documentation (JSON has no native comments). The `_docs` object and its keys are ignored by the bot at runtime.
@@ -278,14 +396,24 @@ P/L is green when positive, red when negative.
 }
 ```
 
+**With Telegram enabled, add (either mode):**
+```json
+{
+  "telegram_bot_token": "",
+  "telegram_chat_id": "123456789"
+}
+```
+Leave `telegram_bot_token` empty in the JSON file and set `TELEGRAM_BOT_TOKEN` via env var instead — same pattern as the Kraken credentials. `telegram_chat_id` isn't a secret and can live in `config.json`, but `TELEGRAM_CHAT_ID` env var also works if preferred.
+
 ---
 
 ## Security — what to do and what not to do
 
 ### Credentials
-- **Never** put `api_key` / `api_secret` in `config.json` or any file that gets baked into the Docker image.
-- Pass credentials only via environment variables (`KRAKEN_API_KEY`, `KRAKEN_API_SECRET`), loaded from a `.env` file that is never committed to git.
+- **Never** put `api_key` / `api_secret` / `telegram_bot_token` in `config.json` or any file that gets baked into the Docker image.
+- Pass credentials only via environment variables (`KRAKEN_API_KEY`, `KRAKEN_API_SECRET`, `TELEGRAM_BOT_TOKEN`), loaded from a `.env` file that is never committed to git.
 - The `.env` file lives only on the production host.
+- If a Telegram bot token is ever pasted into chat/logs/an issue, treat it as compromised — regenerate it via @BotFather's `/revoke`.
 
 ### Docker hardening
 ```yaml
@@ -383,6 +511,7 @@ Note: `config.json` is copied as a fallback default; the volume mount in `docker
 cp main.py config.json Dockerfile /production/kraken-dca/
 echo "KRAKEN_API_KEY=xxx" >> /production/kraken-dca/.env
 echo "KRAKEN_API_SECRET=yyy" >> /production/kraken-dca/.env
+echo "TELEGRAM_BOT_TOKEN=zzz" >> /production/kraken-dca/.env  # optional
 touch /production/kraken-dca/transactions.json
 
 # Every code update (transactions.json is never touched)

@@ -11,6 +11,7 @@ import time
 import hmac
 import hashlib
 import base64
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -138,12 +139,72 @@ class KrakenAPI:
         return self._api_request('/0/private/AddOrder', data, private=True)
 
 
+class TelegramBot:
+    """Minimal Telegram Bot API client (long polling, stdlib only)"""
+
+    API_URL = "https://api.telegram.org"
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def _api_request(self, method: str, params: Optional[Dict] = None, timeout: int = 40) -> Dict:
+        url = f"{self.API_URL}/bot{self.token}/{method}"
+        data = json.dumps(params or {}).encode('utf-8')
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            result = json.loads(response.read().decode('utf-8'))
+        if not result.get('ok'):
+            raise Exception(f"Telegram API error: {result.get('description', result)}")
+        return result.get('result')
+
+    def get_updates(self, offset: Optional[int] = None, poll_timeout: int = 30) -> List[Dict]:
+        """Long-poll for new messages"""
+        params = {'timeout': poll_timeout}
+        if offset is not None:
+            params['offset'] = offset
+        return self._api_request('getUpdates', params, timeout=poll_timeout + 10)
+
+    def send_message(self, chat_id, text: str, reply_markup: Optional[Dict] = None):
+        params = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': 'HTML'
+        }
+        if reply_markup is not None:
+            params['reply_markup'] = reply_markup
+        self._api_request('sendMessage', params)
+
+    def send_photo(self, chat_id, photo_url: str, caption: Optional[str] = None):
+        params = {'chat_id': chat_id, 'photo': photo_url}
+        if caption:
+            params['caption'] = caption
+        self._api_request('sendPhoto', params)
+
+    def answer_callback_query(self, callback_query_id: str, text: Optional[str] = None):
+        params = {'callback_query_id': callback_query_id}
+        if text:
+            params['text'] = text
+        self._api_request('answerCallbackQuery', params)
+
+    def edit_message_reply_markup(self, chat_id, message_id, reply_markup: Optional[Dict] = None):
+        self._api_request('editMessageReplyMarkup', {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'reply_markup': reply_markup or {'inline_keyboard': []}
+        })
+
+    def set_my_commands(self, commands: List[Dict]):
+        """Register the bot's command list so Telegram shows it in the '/' menu"""
+        self._api_request('setMyCommands', {'commands': commands})
+
+
 class TransactionStore:
     """JSON-based transaction storage"""
     
     def __init__(self, filepath: str = 'transactions.json'):
         self.filepath = Path(filepath)
         self.transactions: List[Dict] = []
+        self._lock = threading.Lock()
         self._load()
     
     def _load(self):
@@ -169,8 +230,9 @@ class TransactionStore:
             'amount': amount,
             'price': price
         }
-        self.transactions.append(transaction)
-        self._save()
+        with self._lock:
+            self.transactions.append(transaction)
+            self._save()
     
     def get_transaction_count(self, trading_pair: str = None) -> int:
         """Get total number of transactions, optionally filtered by trading pair"""
@@ -193,6 +255,11 @@ class TransactionStore:
         last_price = pair_txs[-1]['price']
         
         return total_amount, avg_price, last_price, total_spent
+
+    def get_last_transaction(self, trading_pair: str) -> Optional[Dict]:
+        """Get the most recent transaction for a trading pair, or None"""
+        pair_txs = [tx for tx in self.transactions if tx['trading_pair'] == trading_pair]
+        return pair_txs[-1] if pair_txs else None
 
     def get_monthly_spent(self, trading_pair: str, deposit_day: int, buy_hour: int = 0) -> float:
         now = datetime.now()
@@ -229,6 +296,8 @@ class Config:
         self.max_price: Optional[float] = None
         self.max_monthly_amount: Optional[float] = None
         self.dca_end_date: Optional[datetime] = None
+        self.telegram_bot_token: str = ''
+        self.telegram_chat_id: str = ''
         self._load()
     
     def _load(self):
@@ -257,6 +326,8 @@ class Config:
         self.max_monthly_amount = float(max_monthly_raw) if max_monthly_raw is not None else None
         dca_end_raw = config.get('dca_end_date')
         self.dca_end_date = datetime.fromisoformat(dca_end_raw).astimezone() if dca_end_raw else None
+        self.telegram_bot_token = os.environ.get('TELEGRAM_BOT_TOKEN') or config.get('telegram_bot_token', '')
+        self.telegram_chat_id = str(os.environ.get('TELEGRAM_CHAT_ID') or config.get('telegram_chat_id') or '')
 
         # Validation
         if self.mode not in ('recurring', 'lump_sum'):
@@ -303,10 +374,14 @@ class Config:
 class KrakenDCA:
     """Main DCA application"""
     
+    MIN_BUY_BTC = 0.0001  # Kraken's minimum order size
+
     def __init__(self):
         self.config = Config()
         self.api = KrakenAPI(self.config.api_key, self.config.api_secret)
         self.store = TransactionStore()
+        self.telegram = TelegramBot(self.config.telegram_bot_token) if self.config.telegram_bot_token else None
+        self._buy_lock = threading.Lock()
     
     def show_banner(self):
         """Display startup banner"""
@@ -409,52 +484,89 @@ class KrakenDCA:
 
         return next_buy_time, hours_between_buys, int(remaining_hours)
     
-    def execute_buy(self):
-        """Execute a buy order"""
+    def _place_buy(self, amount: float, current_price: float, label: str = "buy"):
+        """Place a market order for `amount` BTC and record the transaction"""
+        order_number = self.store.get_transaction_count(self.config.trading_pair) + 1
+        print(f"\n{Colors.BOLD}Executing {label} order #{order_number}...{Colors.RESET}")
+        print(f"  Amount: {amount:.8f} BTC at {current_price:.2f} {self.get_fiat_currency()}")
+        self.api.place_market_order(self.config.trading_pair, str(amount))
+        self.store.add_transaction(self.config.trading_pair, amount, current_price)
+        print(f"{Colors.GREEN}✓ Order placed successfully{Colors.RESET}")
+        self.display_statistics(current_price)
+        self._notify_buy(order_number, amount, current_price, label)
+
+    def _notify_buy(self, order_number: int, amount: float, price: float, label: str):
+        """Best-effort Telegram notification after any successful buy"""
+        if not (self.telegram and self.config.telegram_chat_id):
+            return
+        try:
+            fiat_currency = self.get_fiat_currency()
+            cost = amount * price
+            self.telegram.send_message(
+                self.config.telegram_chat_id,
+                f"✅ {label.capitalize()} #{order_number}\n"
+                f"{amount:.8f} BTC at {price:.2f} {fiat_currency}\n"
+                f"Cost: {cost:.2f} {fiat_currency}"
+            )
+        except Exception as e:
+            print(f"{Colors.YELLOW}Warning: Telegram buy notification failed: {str(e)}{Colors.RESET}")
+
+    def execute_buy(self, reason: str = "scheduled"):
+        """Execute a scheduled/dip buy order (config.crypto_amount)"""
         try:
             if self.config.mode == 'lump_sum' and datetime.now().astimezone() >= self.config.dca_end_date:
                 print(f"{Colors.YELLOW}⚠ Buy skipped: DCA end date {self.config.dca_end_date.strftime('%Y-%m-%d')} has been reached{Colors.RESET}")
                 return
 
-            # Get current price
             current_price = self.api.get_ticker(self.config.trading_pair)
 
-            if self.config.max_price is not None and current_price > self.config.max_price:
-                print(f"{Colors.YELLOW}⚠ Buy skipped: price {current_price:.2f} is above max_price {self.config.max_price:.2f}{Colors.RESET}")
-                return
-
-            if self.config.max_monthly_amount is not None:
-                monthly_spent = self.store.get_monthly_spent(self.config.trading_pair, self.config.deposit_day, self.config.buy_hour)
-                buy_cost = self.config.crypto_amount * current_price
-                if monthly_spent + buy_cost > self.config.max_monthly_amount:
-                    print(f"{Colors.YELLOW}⚠ Buy skipped: monthly spend {monthly_spent:.2f} + {buy_cost:.2f} would exceed limit {self.config.max_monthly_amount:.2f}{Colors.RESET}")
+            with self._buy_lock:
+                if self.config.max_price is not None and current_price > self.config.max_price:
+                    print(f"{Colors.YELLOW}⚠ Buy skipped: price {current_price:.2f} is above max_price {self.config.max_price:.2f}{Colors.RESET}")
                     return
-            
-            # Get next order number
-            order_number = self.store.get_transaction_count(self.config.trading_pair) + 1
-            
-            # Place order
-            print(f"\n{Colors.BOLD}Executing buy order #{order_number}...{Colors.RESET}")
-            print(f"  Amount: {self.config.crypto_amount:.8f} BTC at {current_price:.2f} {self.get_fiat_currency()}")
-            result = self.api.place_market_order(
-                self.config.trading_pair,
-                str(self.config.crypto_amount)
-            )
-            
-            # Record transaction
-            self.store.add_transaction(
-                self.config.trading_pair,
-                self.config.crypto_amount,
-                current_price
-            )
-            
-            print(f"{Colors.GREEN}✓ Order placed successfully{Colors.RESET}")
-            
-            # Display statistics
-            self.display_statistics(current_price)
-            
+
+                if self.config.max_monthly_amount is not None:
+                    monthly_spent = self.store.get_monthly_spent(self.config.trading_pair, self.config.deposit_day, self.config.buy_hour)
+                    buy_cost = self.config.crypto_amount * current_price
+                    if monthly_spent + buy_cost > self.config.max_monthly_amount:
+                        print(f"{Colors.YELLOW}⚠ Buy skipped: monthly spend {monthly_spent:.2f} + {buy_cost:.2f} would exceed limit {self.config.max_monthly_amount:.2f}{Colors.RESET}")
+                        return
+
+                self._place_buy(self.config.crypto_amount, current_price, label=reason)
+
         except Exception as e:
             print(f"{Colors.RED}✗ Error executing buy: {str(e)}{Colors.RESET}")
+
+    def execute_manual_buy(self, chat_id):
+        """Execute a minimum-size manual buy, triggered from Telegram. Still respects
+        max_price/max_monthly_amount safety limits, but ignores scheduling/dip cooldown."""
+        try:
+            current_price = self.api.get_ticker(self.config.trading_pair)
+            fiat_currency = self.get_fiat_currency()
+
+            with self._buy_lock:
+                if self.config.max_price is not None and current_price > self.config.max_price:
+                    self.telegram.send_message(
+                        chat_id,
+                        f"⚠ Buy skipped: price {current_price:.2f} is above max_price {self.config.max_price:.2f} {fiat_currency}"
+                    )
+                    return
+
+                if self.config.max_monthly_amount is not None:
+                    monthly_spent = self.store.get_monthly_spent(self.config.trading_pair, self.config.deposit_day, self.config.buy_hour)
+                    buy_cost = self.MIN_BUY_BTC * current_price
+                    if monthly_spent + buy_cost > self.config.max_monthly_amount:
+                        self.telegram.send_message(
+                            chat_id,
+                            f"⚠ Buy skipped: monthly spend {monthly_spent:.2f} + {buy_cost:.2f} would exceed limit "
+                            f"{self.config.max_monthly_amount:.2f} {fiat_currency}"
+                        )
+                        return
+
+                self._place_buy(self.MIN_BUY_BTC, current_price, label="manual buy")
+
+        except Exception as e:
+            self.telegram.send_message(chat_id, f"❌ Buy failed: {str(e)}")
     
     def display_statistics(self, current_price: float, next_buy_time: Optional[datetime] = None):
         """Display trading statistics in table format"""
@@ -529,7 +641,279 @@ class KrakenDCA:
             print(f"{Colors.CYAN}{formatted_next_buy:<55}{hours_until_buy:<55.1f}{Colors.RESET}")
 
         print(f"{Colors.BOLD}{'='*110}{Colors.RESET}\n")
-    
+
+    def build_telegram_status(self) -> str:
+        """Build the /status message text for Telegram"""
+        trading_pair = self.config.trading_pair
+        fiat_currency = self.get_fiat_currency()
+        total_amount, avg_price, _, total_spent = self.store.get_statistics(trading_pair)
+        last_tx = self.store.get_last_transaction(trading_pair)
+
+        if self.config.mode == 'lump_sum':
+            mode_str = f"Lump Sum (until {self.config.dca_end_date.strftime('%Y-%m-%d')})"
+        else:
+            mode_str = f"Recurring (day {self.config.deposit_day}, {self.config.buy_hour:02d}:00)"
+
+        if last_tx:
+            last_buy_date = datetime.fromisoformat(last_tx['date']).strftime('%Y-%m-%d %H:%M')
+            last_buy_price_str = f"{last_tx['price']:.2f} {fiat_currency}"
+        else:
+            last_buy_date = "none yet"
+            last_buy_price_str = "n/a"
+
+        try:
+            next_buy_time, _, _ = self.calculate_next_buy()
+            next_buy_str = next_buy_time.strftime('%Y-%m-%d %H:%M %Z')
+        except Exception:
+            next_buy_str = "unavailable"
+
+        lines = [
+            "<b>Kraken DCA Status</b>",
+            f"Mode: {mode_str}",
+            f"BTC Amount: {total_amount:.8f} BTC",
+            f"Average Buy Price: {avg_price:.2f} {fiat_currency}",
+            f"Amount Invested: {total_spent:.2f} {fiat_currency}",
+            f"Last Buy: {last_buy_date}",
+            f"Last Buy Price: {last_buy_price_str}",
+            f"Next Buy: {next_buy_str}",
+        ]
+
+        try:
+            current_price = self.api.get_ticker(trading_pair)
+            pl_percent = ((current_price - avg_price) / avg_price * 100) if avg_price > 0 else 0.0
+            lines.append(f"Current Price: {current_price:.2f} {fiat_currency}")
+            lines.append(f"P/L: {pl_percent:+.2f}%")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+
+    def build_chart_url(self, max_points: int = 60, mode: str = 'full') -> Optional[str]:
+        """Build a QuickChart.io URL. mode='full' charts cumulative BTC held alongside
+        price; mode='price' omits BTC held and shows just the price lines. Aggregated
+        per-day (not per-transaction) to keep the chart readable and the URL short,
+        since dip/scheduled buys can produce hundreds of transactions."""
+        trading_pair = self.config.trading_pair
+        pair_txs = sorted(
+            (tx for tx in self.store.transactions if tx['trading_pair'] == trading_pair),
+            key=lambda tx: tx['date']
+        )
+        if not pair_txs:
+            return None
+
+        daily: Dict[str, Dict[str, float]] = {}
+        for tx in pair_txs:
+            day = tx['date'][:10]
+            entry = daily.setdefault(day, {'amount': 0.0, 'price_sum': 0.0, 'count': 0})
+            entry['amount'] += tx['amount']
+            entry['price_sum'] += tx['price']
+            entry['count'] += 1
+
+        days = sorted(daily.keys())
+        cumulative = 0.0
+        cumulative_series = []
+        price_series = []
+        for day in days:
+            cumulative += daily[day]['amount']
+            cumulative_series.append(round(cumulative, 8))
+            price_series.append(round(daily[day]['price_sum'] / daily[day]['count'], 2))
+
+        if len(days) > max_points:
+            step = len(days) / max_points
+            indices = sorted(set(int(i * step) for i in range(max_points)) | {len(days) - 1})
+            days = [days[i] for i in indices]
+            cumulative_series = [cumulative_series[i] for i in indices]
+            price_series = [price_series[i] for i in indices]
+
+        _, overall_avg_price, _, _ = self.store.get_statistics(trading_pair)
+        fiat_currency = self.get_fiat_currency()
+        price_axis_id = 'y1' if mode == 'full' else 'y'
+
+        datasets = []
+        if mode == 'full':
+            datasets.append({
+                'label': 'BTC Held',
+                'data': cumulative_series,
+                'borderColor': '#f7a21a',
+                'backgroundColor': 'rgba(247,162,26,0.15)',
+                'fill': True,
+                'yAxisID': 'y',
+                'pointRadius': 0,
+                'tension': 0.15
+            })
+        datasets.append({
+            'label': f'Daily Avg Price ({fiat_currency})',
+            'data': price_series,
+            'borderColor': '#3ed68e',
+            'yAxisID': price_axis_id,
+            'pointRadius': 0,
+            'fill': False,
+            'tension': 0.15
+        })
+        datasets.append({
+            'label': f'Overall Avg Buy Price ({fiat_currency})',
+            'data': [round(overall_avg_price, 2)] * len(days),
+            'borderColor': '#f26060',
+            'borderDash': [6, 6],
+            'yAxisID': price_axis_id,
+            'pointRadius': 0,
+            'fill': False
+        })
+
+        if mode == 'full':
+            y_axes = [
+                {'id': 'y', 'position': 'left', 'scaleLabel': {'display': True, 'labelString': 'BTC Held'}},
+                {'id': 'y1', 'position': 'right', 'scaleLabel': {'display': True, 'labelString': fiat_currency},
+                 'gridLines': {'drawOnChartArea': False}}
+            ]
+            title = f'{trading_pair} — Accumulation & Price'
+        else:
+            y_axes = [
+                {'id': 'y', 'position': 'left', 'scaleLabel': {'display': True, 'labelString': fiat_currency}}
+            ]
+            title = f'{trading_pair} — Price History'
+
+        chart_config = {
+            'type': 'line',
+            'data': {
+                'labels': days,
+                'datasets': datasets
+            },
+            'options': {
+                'title': {'display': True, 'text': title},
+                'legend': {'display': True},
+                'scales': {'yAxes': y_axes}
+            }
+        }
+        config_json = json.dumps(chart_config, separators=(',', ':'))
+        encoded = urllib.parse.quote(config_json)
+        return f"https://quickchart.io/chart?c={encoded}&width=800&height=400&backgroundColor=white"
+
+    def handle_telegram_message(self, message: Dict):
+        """Handle a single incoming Telegram message"""
+        chat_id = message.get('chat', {}).get('id')
+        text = (message.get('text') or '').strip()
+        if chat_id is None:
+            return
+
+        if not self.config.telegram_chat_id:
+            self.telegram.send_message(
+                chat_id,
+                f"Bot not yet authorized.\nYour chat ID is: <code>{chat_id}</code>\n"
+                f"Add it to config.json as \"telegram_chat_id\" and restart to authorize this chat."
+            )
+            return
+
+        if str(chat_id) != self.config.telegram_chat_id:
+            self.telegram.send_message(chat_id, "Unauthorized.")
+            return
+
+        parts = text.split()
+        command = parts[0].lower() if parts else ''
+        args = parts[1:]
+        if command in ('/start', '/help'):
+            self.telegram.send_message(
+                chat_id,
+                "Available commands:\n"
+                "/status - portfolio status (amount, avg price, last/next buy, mode)\n"
+                f"/buy - manually buy {self.MIN_BUY_BTC:.8f} BTC (Kraken minimum) at market price\n"
+                "/chart - chart of BTC held and average price over time\n"
+                "/chart price - same chart without the BTC held line, just price"
+            )
+        elif command == '/chart':
+            chart_mode = 'price' if args and args[0].lower() == 'price' else 'full'
+            try:
+                chart_url = self.build_chart_url(mode=chart_mode)
+                if chart_url is None:
+                    self.telegram.send_message(chat_id, "No transactions yet.")
+                else:
+                    caption = f"{self.config.trading_pair} — avg price" if chart_mode == 'price' else f"{self.config.trading_pair} — BTC held & avg price"
+                    self.telegram.send_photo(chat_id, chart_url, caption=caption)
+            except Exception as e:
+                self.telegram.send_message(chat_id, f"Error building chart: {str(e)}")
+        elif command == '/status':
+            try:
+                self.telegram.send_message(chat_id, self.build_telegram_status())
+            except Exception as e:
+                self.telegram.send_message(chat_id, f"Error building status: {str(e)}")
+        elif command == '/buy':
+            keyboard = {
+                'inline_keyboard': [[
+                    {'text': f'✅ Confirm buy {self.MIN_BUY_BTC:.4f} BTC', 'callback_data': 'buy_confirm'},
+                    {'text': '❌ Cancel', 'callback_data': 'buy_cancel'}
+                ]]
+            }
+            try:
+                fiat_currency = self.get_fiat_currency()
+                current_price = self.api.get_ticker(self.config.trading_pair)
+                cost = self.MIN_BUY_BTC * current_price
+                price_line = f"Market price: {current_price:.2f} {fiat_currency}\nCost: ~{cost:.2f} {fiat_currency}\n\n"
+            except Exception:
+                price_line = ""
+            self.telegram.send_message(
+                chat_id,
+                f"{price_line}Buy {self.MIN_BUY_BTC:.8f} BTC (Kraken minimum) at current market price?",
+                reply_markup=keyboard
+            )
+        else:
+            self.telegram.send_message(chat_id, "Unknown command. Try /status, /buy, or /chart")
+
+    def handle_telegram_callback(self, callback_query: Dict):
+        """Handle an inline keyboard button press"""
+        callback_id = callback_query.get('id')
+        message = callback_query.get('message') or {}
+        chat_id = message.get('chat', {}).get('id')
+        message_id = message.get('message_id')
+        data = callback_query.get('data', '')
+
+        if chat_id is None:
+            return
+
+        if not self.config.telegram_chat_id or str(chat_id) != self.config.telegram_chat_id:
+            self.telegram.answer_callback_query(callback_id, "Unauthorized")
+            return
+
+        # Remove the buttons immediately so a double-tap can't fire two orders
+        try:
+            self.telegram.edit_message_reply_markup(chat_id, message_id)
+        except Exception:
+            pass
+
+        if data == 'buy_confirm':
+            self.telegram.answer_callback_query(callback_id, "Placing order...")
+            self.execute_manual_buy(chat_id)
+        elif data == 'buy_cancel':
+            self.telegram.answer_callback_query(callback_id, "Cancelled")
+            self.telegram.send_message(chat_id, "Buy cancelled.")
+        else:
+            self.telegram.answer_callback_query(callback_id)
+
+    def telegram_loop(self):
+        """Background long-polling loop for Telegram commands"""
+        offset = None
+        try:
+            self.telegram.set_my_commands([
+                {'command': 'status', 'description': 'Portfolio status: amount, avg price, last/next buy, mode'},
+                {'command': 'buy', 'description': f'Manually buy {self.MIN_BUY_BTC:.4f} BTC (Kraken minimum)'},
+                {'command': 'chart', 'description': 'Chart of BTC held and average price over time'},
+                {'command': 'help', 'description': 'Show available commands'},
+            ])
+        except Exception as e:
+            print(f"{Colors.YELLOW}Warning: Could not register Telegram commands: {str(e)}{Colors.RESET}")
+        print(f"{Colors.GREEN}✓ Telegram bot listening for commands{Colors.RESET}")
+        while True:
+            try:
+                updates = self.telegram.get_updates(offset)
+                for update in updates:
+                    offset = update['update_id'] + 1
+                    if update.get('message'):
+                        self.handle_telegram_message(update['message'])
+                    elif update.get('callback_query'):
+                        self.handle_telegram_callback(update['callback_query'])
+            except Exception as e:
+                print(f"{Colors.YELLOW}Warning: Telegram polling error: {str(e)}{Colors.RESET}")
+                time.sleep(5)
+
     def run(self):
         """Main application loop"""
         self.show_banner()
@@ -548,7 +932,12 @@ class KrakenDCA:
         print(f"  Max Price: {Colors.CYAN}{self.config.max_price:.2f} {self.get_fiat_currency()}{Colors.RESET}" if self.config.max_price else f"  Max Price: {Colors.CYAN}disabled{Colors.RESET}")
         print(f"  Max Monthly: {Colors.CYAN}{self.config.max_monthly_amount:.2f} {self.get_fiat_currency()}{Colors.RESET}" if self.config.max_monthly_amount else f"  Max Monthly: {Colors.CYAN}disabled{Colors.RESET}")
         print(f"  Poll Interval: {Colors.CYAN}{self.config.poll_interval_seconds}s{Colors.RESET}\n")
-        
+
+        if self.telegram:
+            threading.Thread(target=self.telegram_loop, daemon=True).start()
+        else:
+            print(f"{Colors.YELLOW}Telegram integration disabled (no telegram_bot_token configured){Colors.RESET}\n")
+
         # Display existing portfolio if we have transactions
         total_amount, _, _, _ = self.store.get_statistics(self.config.trading_pair)
         if total_amount > 0:
@@ -632,7 +1021,7 @@ class KrakenDCA:
                             if cooldown_ok:
                                 print(f"\n{Colors.MAGENTA}{Colors.BOLD}DIP DETECTED!{Colors.RESET} "
                                       f"Price {current_price:.2f} is ≥{self.config.dip_threshold_percent}% below last buy price {last_buy_price:.2f}")
-                                self.execute_buy()
+                                self.execute_buy(reason="dip")
                                 last_dip_buy_time = now
                                 # Recalculate schedule after dip buy
                                 next_buy_time, hours_until_buy, remaining_hours = self.calculate_next_buy()

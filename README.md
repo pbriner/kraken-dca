@@ -6,14 +6,16 @@ A secure, production-ready Docker application for automated Dollar Cost Averagin
 
 ## 🎯 Features
 
-- ✅ **Automated DCA Strategy**: Intelligently spreads purchases until next deposit day (8 AM)
-- ✅ **Smart Dip Buying**: Automatically buys when price drops 5% or more from last purchase
-- ✅ **Real-time Price Monitoring**: Checks price every minute for opportunities
+- ✅ **Two DCA Modes**: `recurring` (spread buys between monthly deposits) or `lump_sum` (spread a one-time deposit evenly until a target end date)
+- ✅ **Smart Dip Buying**: Automatically buys when price drops below a configurable threshold from the last purchase (with a cooldown)
+- ✅ **Real-time Price Monitoring**: Checks price on a configurable poll interval for dip and deposit opportunities
+- ✅ **Guardrails**: Optional `max_price` (skip buys above a price ceiling) and `max_monthly_amount` (spend cap per cycle)
 - ✅ **Enhanced Transaction Display**: Shows order numbers and detailed statistics
 - ✅ **Timezone-Aware Scheduling**: Displays exact date/time for next purchases
 - ✅ **Live Balance Tracking**: Shows current fiat available and estimated buy actions
 - ✅ **Secure API Integration**: Direct HTTPS communication with Kraken API
 - ✅ **Zero External Dependencies**: Uses only Python standard library (urllib, hmac, json)
+- ✅ **Telegram Integration**: Query status, chart your history, trigger manual buys, and get notified on every buy — all from Telegram (optional)
 - ✅ **Transaction Tracking**: JSON-based persistent storage of all trades
 - ✅ **Real-time P/L Monitoring**: Color-coded profit/loss reporting with currency labels
 - ✅ **Docker Containerized**: Isolated, reproducible deployment
@@ -49,25 +51,45 @@ cd kraken-dca
 
 ### 2. Configure the Application
 
-Edit `config.json` with your settings:
+Put your Kraken API credentials in `.env` (never in `config.json`):
+
+```
+KRAKEN_API_KEY=your_key_here
+KRAKEN_API_SECRET=your_secret_here
+```
+
+Edit `config.json` with your trading settings:
 
 ```json
 {
+  "mode": "recurring",
+  "dca_end_date": null,
   "trading_pair": "XXBTZUSD",
   "deposit_day": 1,
-  "api_key": "YOUR_KRAKEN_API_KEY_HERE",
-  "api_secret": "YOUR_KRAKEN_API_SECRET_HERE",
-  "crypto_amount": 0.0001
+  "buy_hour": 8,
+  "crypto_amount": 0.0001,
+  "dip_threshold_percent": 5.0,
+  "dip_buy_cooldown_hours": 2.0,
+  "poll_interval_seconds": 300,
+  "max_price": null,
+  "max_monthly_amount": null
 }
 ```
 
 **Configuration Options:**
 
+- `mode`: `"recurring"` (spread buys between monthly deposits) or `"lump_sum"` (spread a one-time deposit evenly until `dca_end_date`)
+- `dca_end_date`: Required in `lump_sum` mode — ISO date (`YYYY-MM-DD`) after which buying stops. Unused in `recurring` mode.
 - `trading_pair`: Kraken trading pair (e.g., "XXBTZUSD" for BTC/USD, "XETHZUSD" for ETH/USD)
-- `deposit_day`: Day of month (1-28) when you deposit funds (purchases spread from 8:00 AM on this day)
-- `api_key`: Your Kraken API public key
-- `api_secret`: Your Kraken API private key
-- `crypto_amount`: Amount of crypto to buy per transaction (e.g., 0.0001 BTC)
+- `deposit_day`: Day of month (1-28) when you deposit funds (recurring mode only — the cycle resets and the scheduled buy fires on this day)
+- `buy_hour`: Hour of day (0-23) the scheduled buy fires
+- `crypto_amount`: Amount of crypto to buy per scheduled/dip order (e.g., 0.0001 BTC — Kraken's minimum)
+- `dip_threshold_percent`: % price drop below the last buy that triggers an extra dip buy
+- `dip_buy_cooldown_hours`: Minimum hours between two consecutive dip buys
+- `poll_interval_seconds`: How often the bot checks price/balance (minimum 60)
+- `max_price`: Skip any buy if price is above this value. `null` to disable
+- `max_monthly_amount`: Cap fiat spend per cycle (recurring) or calendar month (lump_sum). `null` to disable
+- `telegram_bot_token` / `telegram_chat_id`: Optional — see [Telegram Integration](#-telegram-integration-optional) below
 
 **Finding Trading Pairs:**
 Common Kraken pairs:
@@ -79,52 +101,55 @@ Common Kraken pairs:
 
 ```bash
 # Build the Docker image (use --no-cache for a clean build)
-docker-compose build --no-cache
+docker compose build --no-cache
 
 # Start the application
-docker-compose up -d
+docker compose up -d
 
 # View logs
-docker-compose logs -f
+docker compose logs -f
 ```
 
 ### 4. Stop the Application
 
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ## 📊 How It Works
 
 ### DCA Logic
 
-1. **Calculate Remaining Time**: Determines hours until next deposit day at 8:00 AM (configured in `deposit_day`)
-2. **Distribute Purchases**: Spreads buys evenly across remaining time to empty fiat balance by deposit day
-3. **Monitor Price Changes**: Checks price every minute for dip buying opportunities
-4. **Execute Trades**: Places market orders at calculated intervals or when 5% dip detected
-5. **Record Transactions**: Saves all trades to `transactions.json` with sequential order numbers
-6. **Display Statistics**: Shows P/L with currency labels after each purchase
+1. **Calculate Remaining Time**: In `recurring` mode, hours until the next `deposit_day` at `buy_hour`. In `lump_sum` mode, hours until `dca_end_date`.
+2. **Distribute Purchases**: Spreads buys evenly across the remaining time so the available fiat balance is deployed gradually rather than in one hit.
+3. **Monitor Price Changes**: Checks price every `poll_interval_seconds` (default 300s) for dip buying opportunities.
+4. **Execute Trades**: Places market orders at calculated intervals, or immediately when a dip is detected — subject to `max_price` and `max_monthly_amount` guards.
+5. **Record Transactions**: Saves all trades to `transactions.json` with sequential order numbers.
+6. **Display Statistics**: Shows P/L with currency labels after each purchase.
 
 ### Smart Dip Buying
 
-The application monitors the price every minute and triggers an additional buy when:
-- Current price drops **5% or more** below the last purchase price
-- Sufficient fiat balance is available for the purchase
+The application polls the price every `poll_interval_seconds` and triggers an additional buy when:
+- Current price drops **`dip_threshold_percent`% or more** below the last purchase price (default 5%)
+- The cooldown since the last dip buy (`dip_buy_cooldown_hours`) has elapsed
+- Sufficient fiat balance is available and `max_price`/`max_monthly_amount` aren't exceeded
 
 This combines regular DCA (spreading purchases evenly) with opportunistic buying during price dips.
 
 ### Example
 
-**Scenario**: Today is the 15th, your deposit day is the 1st, you have 5000 CHF available
-
-**Regular DCA**:
+**Recurring mode** — Today is the 15th, your deposit day is the 1st, you have 5000 CHF available:
 - Remaining time until next deposit (1st at 8 AM): ~384 hours
 - Current BTC price: 50,000 CHF
 - Cost per buy (0.0001 BTC): 5 CHF
 - Maximum buys possible: 1000 buys
 - Strategy: Buy every ~0.38 hours until deposit day
 
-**Dip Buying**:
+**Lump sum mode** — You deposit 10,000 CHF once, `dca_end_date` is 90 days out:
+- The bot spreads buys evenly across those 90 days using the same interval-calculation logic
+- As the balance depletes or the price moves, the interval between buys recalculates automatically
+
+**Dip Buying** (either mode):
 - Last buy price: 50,000 CHF
 - Current price drops to: 47,000 CHF (6.0% drop)
 - 🔔 **Dip Alert triggered!**
@@ -137,10 +162,12 @@ This combines regular DCA (spreading purchases evenly) with opportunistic buying
 
 ```
 Next scheduled buy: 2026-02-15 14:30:00 CET
+Current price: 58138.90 CHF
+Dip buy threshold (5.0%): 55231.96 CHF
 Current fiat available: 5475.20 CHF
 Estimated buy actions till deposit day: 12
 Remaining hours until deposit day: 456
-Monitoring for price dips...
+Monitoring every 5 minutes...
 ```
 
 ### Dip Alert
@@ -185,6 +212,36 @@ Current Price (CHF)           Total Invested (CHF)          Current Value (CHF) 
 - **Current Value**: Current worth of holdings (in your fiat currency)
 - **P/L Fiat**: Profit/loss in fiat currency
 
+## 🤖 Telegram Integration (Optional)
+
+Query your portfolio, trigger manual buys, chart your history, and get notified whenever a buy executes — all from Telegram.
+
+### Setup
+
+1. Message [@BotFather](https://t.me/BotFather) on Telegram, run `/newbot`, and copy the token it gives you.
+2. Add it to `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=123456:ABC-your-token
+   ```
+3. Restart the bot and send it any message (e.g. `/start`). Since `telegram_chat_id` isn't set yet, it will reply with your chat ID instead of any portfolio data.
+4. Add that chat ID to `config.json` (or `.env` as `TELEGRAM_CHAT_ID`):
+   ```json
+   "telegram_chat_id": "123456789"
+   ```
+5. Restart. The bot now only responds to that chat.
+
+### Commands
+
+- `/status` — current BTC amount, average buy price, last buy (date & price), next scheduled buy, current mode, current price, P/L
+- `/buy` — sends an inline confirm/cancel button; confirming places an immediate market buy for the Kraken minimum (0.0001 BTC), still respecting `max_price` and `max_monthly_amount`
+- `/chart` — chart of BTC held (cumulative) and average buy price over time, rendered via [QuickChart.io](https://quickchart.io) and sent as a photo
+- `/chart price` — same chart, without the BTC-held line, just price
+- `/help` — lists all commands
+
+Every executed buy — scheduled, dip, or manual — sends a Telegram notification automatically (order number, amount, price, cost), labeled by how it happened.
+
+Only the configured `telegram_chat_id` can use the bot — everyone else gets an "Unauthorized" reply.
+
 ## 📁 File Structure
 
 ```
@@ -192,11 +249,16 @@ kraken-dca/
 ├── main.py              # Main application code
 ├── config.json          # Configuration file (edit this)
 ├── transactions.json    # Transaction history (auto-generated)
+├── .env                 # KRAKEN_API_KEY / KRAKEN_API_SECRET / TELEGRAM_* (never committed)
 ├── Dockerfile           # Docker image definition
 ├── docker-compose.yml   # Docker Compose configuration
 ├── .dockerignore       # Docker ignore rules
 ├── .gitignore          # Git ignore rules
-└── README.md           # This file
+├── README.md            # This file
+├── INSTALL.md            # Quick installation guide
+├── SECURITY.md           # Security policy and hardening guide
+├── docs.html             # Standalone HTML documentation page
+└── share-dca-bot.md      # Full technical build guide (architecture, internals)
 ```
 
 ## 🔒 Security Features
@@ -206,7 +268,7 @@ kraken-dca/
 1. **Minimal Dependencies**: Uses only Python standard library (no third-party packages)
 2. **Input Validation**: All config values are validated on startup
 3. **Secure API Communication**: HTTPS only, proper HMAC signature generation
-4. **API Key Protection**: Never logged or exposed
+4. **Credential Isolation**: API keys are read from `KRAKEN_API_KEY`/`KRAKEN_API_SECRET` environment variables (via `.env`, gitignored), never stored in `config.json`; the same pattern applies to the optional Telegram bot token
 5. **Error Handling**: Graceful failure without exposing sensitive data
 
 ### Docker Security
@@ -232,18 +294,19 @@ The application requires only:
 ### Test API Connection
 
 ```bash
-docker-compose up
+docker compose up
 ```
 
 The application will:
 1. Display the startup banner
 2. Test API connection
-3. Show configuration (including dip buy trigger: 5%)
+3. Show configuration (mode, trading pair, dip threshold, cooldown, price/spend guards)
 4. Display existing portfolio (if any)
-5. Show next scheduled buy with timezone
-6. Display current fiat balance
-7. Show estimated buy actions until deposit day
-8. Begin monitoring price every minute
+5. Start the Telegram listener thread, if `telegram_bot_token` is configured
+6. Show next scheduled buy with timezone
+7. Display current fiat balance
+8. Show estimated buy actions remaining in the cycle
+9. Begin monitoring price on the configured poll interval
 
 ### Manual Testing
 
@@ -260,7 +323,8 @@ The application is designed to withstand:
 - ✅ Path Traversal (validates file paths)
 - ✅ API Key Exposure (not logged or stored in plaintext in code)
 - ✅ Privilege Escalation (runs as non-root)
-- ✅ DoS (rate limiting by design - price check every 60 seconds, purchases at calculated intervals)
+- ✅ DoS (rate limiting by design - price checks on the configured poll interval, purchases at calculated intervals)
+- ✅ Telegram Bot Abuse (only the configured `telegram_chat_id` gets responses; manual buys require an explicit inline-button confirmation)
 
 ## 📝 Transaction Storage
 
@@ -293,7 +357,16 @@ Transactions are stored in `transactions.json`:
 
 ## 🆕 What's New
 
-### Recent Updates (February 2026)
+### Recent Updates (August 2026)
+
+1. **Telegram Integration**: Query `/status` (BTC amount, average price, last/next buy, mode, P/L), chart your history with `/chart` (or `/chart price` for price-only), and trigger manual minimum-size buys with `/buy` — all gated to a single authorized chat ID
+2. **Automatic Buy Notifications**: Every scheduled, dip, or manual buy now sends a Telegram message with the order number, amount, price, and cost
+3. **Lump Sum Mode**: New `mode: "lump_sum"` spreads a one-time deposit evenly until a configured `dca_end_date`, as an alternative to the recurring monthly cycle
+4. **Spend & Price Guards**: `max_price` and `max_monthly_amount` config options skip buys above a price ceiling or once a spend cap is hit
+5. **Configurable Poll Interval**: `poll_interval_seconds` replaces the old fixed 60-second check
+6. **Environment-Based Credentials**: `KRAKEN_API_KEY`/`KRAKEN_API_SECRET` (and the optional Telegram token) are read from environment variables, never stored in `config.json`
+
+### Earlier Updates (February 2026)
 
 1. **Timezone Support**: Next buy time now displays with full timezone information (e.g., "2026-02-15 14:30:00 CET")
 
@@ -305,9 +378,9 @@ Transactions are stored in `transactions.json`:
 
 5. **Live Balance Tracking**: Shows current fiat balance and estimated buy actions remaining
 
-6. **Smart Dip Buying**: Automatically detects and executes purchases when price drops 5% or more from last buy
+6. **Smart Dip Buying**: Automatically detects and executes purchases when price drops below a configurable threshold from last buy
 
-7. **Minute-by-Minute Monitoring**: Checks price every 60 seconds for dip opportunities while waiting for scheduled buys
+7. **Continuous Monitoring**: Checks price on the configured poll interval for dip opportunities while waiting for scheduled buys
 
 ## 🐛 Troubleshooting
 
@@ -343,18 +416,18 @@ Transactions are stored in `transactions.json`:
 
 ```bash
 # Check logs
-docker-compose logs
+docker compose logs
 
 # Rebuild
-docker-compose down
-docker-compose build --no-cache
-docker-compose up
+docker compose down
+docker compose build --no-cache
+docker compose up
 ```
 
 ### Price Not Updating
 
 If you notice the price isn't being checked every minute:
-1. Check container logs for errors: `docker-compose logs -f`
+1. Check container logs for errors: `docker compose logs -f`
 2. Verify network connectivity
 3. Check Kraken API status: https://status.kraken.com/
 
@@ -365,9 +438,9 @@ If you notice the price isn't being checked every minute:
 git pull
 
 # Rebuild and restart
-docker-compose down
-docker-compose build
-docker-compose up -d
+docker compose down
+docker compose build
+docker compose up -d
 ```
 
 ## 💡 Tips & Best Practices

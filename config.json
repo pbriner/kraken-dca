@@ -15,17 +15,21 @@
     "dip_buy_cooldown_hours": "Minimum hours between two consecutive dip buys, to avoid over-buying during a crash.",
     "poll_interval_seconds": "How often the bot checks prices and conditions, in seconds (minimum 60).",
     "max_price": "Skip any buy if the current price is above this value (in fiat). Useful to avoid buying at ATH. Set to null to disable.",
-    "max_monthly_amount": "Maximum fiat to spend per period (deposit_day to deposit_day in recurring, or per calendar month in lump_sum). Set to null to disable."
+    "max_monthly_amount": "Maximum fiat to spend per period (deposit_day to deposit_day in recurring, or per calendar month in lump_sum). Set to null to disable.",
+    "telegram_bot_token": "Optional. Token for a Telegram bot (from @BotFather) that lets you query status and trigger manual buys. Leave empty to disable. Prefer passing via TELEGRAM_BOT_TOKEN environment variable instead of storing it here.",
+    "telegram_chat_id": "Optional. Your personal Telegram chat ID — the only chat the bot will respond to. Leave empty and message the bot once; it will reply with your chat ID to fill in here. Can also be set via TELEGRAM_CHAT_ID environment variable."
   },
-   "mode": "recurring",
-  "dca_end_date": null,
+   "mode": "lump_sum",
+  "dca_end_date": "2026-11-10",
   "trading_pair": "XBTCHF",
   "deposit_day": 24,
   "crypto_amount": 0.0001,
-  "dip_threshold_percent": 5.0,
+  "dip_threshold_percent": 2.0,
   "poll_interval_seconds": 300,
   "buy_hour": 8,
-  "dip_buy_cooldown_hours": 2.0,
-  "max_price": 65000,
-  "max_monthly_amount": 10000
+  "dip_buy_cooldown_hours": 0.2,
+  "max_price": 55000,
+  "max_monthly_amount": 100000,
+  "telegram_bot_token": "",
+  "telegram_chat_id": "1978709615"
 }

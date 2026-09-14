@@ -17,30 +17,47 @@ A complete, production-ready Docker application for automated cryptocurrency DCA
 # Navigate to the project directory
 cd kraken-dca
 
-# Edit configuration
-nano config.json
+# Add your Kraken credentials — never put these in config.json
+nano .env
+```
+```
+KRAKEN_API_KEY=your_key_here
+KRAKEN_API_SECRET=your_secret_here
+```
 
-# Update these values:
+```bash
+# Edit trading configuration
+nano config.json
+```
+```json
 {
-  "trading_pair": "XXBTZUSD",      # BTC/USD or your preferred pair
-  "deposit_day": 1,                 # Day of month (1-28) when you deposit
-  "api_key": "YOUR_KEY_HERE",      # Your Kraken API key
-  "api_secret": "YOUR_SECRET_HERE", # Your Kraken API secret
-  "crypto_amount": 0.0001           # Amount to buy per transaction
+  "mode": "recurring",              # "recurring" or "lump_sum"
+  "dca_end_date": null,             # required if mode is "lump_sum", e.g. "2027-06-01"
+  "trading_pair": "XXBTZUSD",       # BTC/USD or your preferred pair
+  "deposit_day": 1,                 # day of month (1-28) when you deposit (recurring mode)
+  "buy_hour": 8,                    # hour of day the scheduled buy fires
+  "crypto_amount": 0.0001,          # amount to buy per transaction
+  "dip_threshold_percent": 5.0,     # % drop that triggers a dip buy
+  "dip_buy_cooldown_hours": 2.0,    # min hours between dip buys
+  "poll_interval_seconds": 300,     # how often price/balance is checked
+  "max_price": null,                # optional price ceiling, null to disable
+  "max_monthly_amount": null        # optional spend cap, null to disable
 }
 ```
+
+Optionally, add Telegram bot access — see `README.md` → Telegram Integration.
 
 ### 3. Run
 
 ```bash
 # Build and start
-docker-compose up -d
+docker compose up -d
 
 # View logs
-docker-compose logs -f
+docker compose logs -f
 
 # Stop
-docker-compose down
+docker compose down
 ```
 
 ## 🔐 Security Setup
@@ -49,6 +66,7 @@ docker-compose down
 ```bash
 chmod 600 config.json
 chmod 600 transactions.json
+chmod 600 .env
 ```
 
 ### Kraken API Permissions
@@ -75,10 +93,17 @@ Testing Kraken API Connection...
 ✓ API Connection Successful
 
 Configuration:
+  Mode: Recurring
   Trading Pair: XXBTZUSD
-  Deposit Day: 1
+  Deposit Day: 1 at 8:00
   Crypto Amount per Buy: 0.0001
+  Dip Threshold: 5.0%
+  Dip Buy Cooldown: 2.0h
+  Max Price: disabled
+  Max Monthly: disabled
+  Poll Interval: 300s
 
+✓ Telegram bot listening for commands   (only if telegram_bot_token is set)
 Application started successfully!
 ```
 
@@ -89,10 +114,12 @@ kraken-dca/
 ├── main.py              # Application code
 ├── config.json          # Your configuration
 ├── transactions.json    # Trade history
+├── .env                 # KRAKEN_API_KEY / KRAKEN_API_SECRET / TELEGRAM_* (never committed)
 ├── Dockerfile           # Container definition
 ├── docker-compose.yml   # Deployment config
 ├── README.md           # Full documentation
 ├── SECURITY.md         # Security guide
+├── docs.html            # Standalone HTML documentation page
 └── LICENSE             # MIT License
 ```
 
@@ -109,10 +136,10 @@ kraken-dca/
 
 ### Container won't start
 ```bash
-docker-compose logs  # Check logs
-docker-compose down
-docker-compose build --no-cache
-docker-compose up -d
+docker compose logs  # Check logs
+docker compose down
+docker compose build --no-cache
+docker compose up -d
 ```
 
 ## 📚 Next Steps
