@@ -222,43 +222,72 @@ class TransactionStore:
         with open(self.filepath, 'w') as f:
             json.dump(self.transactions, f, indent=2)
     
-    def add_transaction(self, trading_pair: str, amount: float, price: float):
-        """Add new transaction"""
+    def add_transaction(self, trading_pair: str, amount: float, price: float, tx_type: str = 'buy'):
+        """Add new transaction. tx_type is 'buy' or 'sell'."""
         transaction = {
             'date': datetime.now().isoformat(),
             'trading_pair': trading_pair,
             'amount': amount,
-            'price': price
+            'price': price,
+            'type': tx_type
         }
         with self._lock:
             self.transactions.append(transaction)
             self._save()
-    
+
     def get_transaction_count(self, trading_pair: str = None) -> int:
         """Get total number of transactions, optionally filtered by trading pair"""
         if trading_pair:
             return len([tx for tx in self.transactions if tx['trading_pair'] == trading_pair])
         return len(self.transactions)
-    
+
+    @staticmethod
+    def _tx_type(tx: Dict) -> str:
+        """Transactions recorded before sell support was added have no 'type' field;
+        treat those as buys."""
+        return tx.get('type', 'buy')
+
     def get_statistics(self, trading_pair: str) -> Tuple[float, float, float, float]:
-        """Calculate statistics for trading pair
-        Returns: (total_amount, avg_price, last_price, total_spent)
+        """Calculate statistics for trading pair using the average-cost method, so a
+        sell reduces the held amount and its proportional share of cost basis rather
+        than being netted into it directly.
+        Returns: (total_amount, avg_price, last_buy_price, total_spent)
+        where total_spent is the cost basis of currently held coins.
         """
-        pair_txs = [tx for tx in self.transactions if tx['trading_pair'] == trading_pair]
-        
+        pair_txs = sorted(
+            (tx for tx in self.transactions if tx['trading_pair'] == trading_pair),
+            key=lambda tx: tx['date']
+        )
+
         if not pair_txs:
             return 0.0, 0.0, 0.0, 0.0
-        
-        total_amount = sum(tx['amount'] for tx in pair_txs)
-        total_spent = sum(tx['amount'] * tx['price'] for tx in pair_txs)
-        avg_price = total_spent / total_amount if total_amount > 0 else 0.0
-        last_price = pair_txs[-1]['price']
-        
-        return total_amount, avg_price, last_price, total_spent
 
-    def get_last_transaction(self, trading_pair: str) -> Optional[Dict]:
-        """Get the most recent transaction for a trading pair, or None"""
-        pair_txs = [tx for tx in self.transactions if tx['trading_pair'] == trading_pair]
+        amount = 0.0
+        cost_basis = 0.0
+        last_buy_price = 0.0
+        for tx in pair_txs:
+            if self._tx_type(tx) == 'sell':
+                if amount > 0:
+                    sell_amount = min(tx['amount'], amount)
+                    cost_basis -= sell_amount * (cost_basis / amount)
+                    amount -= sell_amount
+            else:
+                amount += tx['amount']
+                cost_basis += tx['amount'] * tx['price']
+                last_buy_price = tx['price']
+
+        avg_price = cost_basis / amount if amount > 0 else 0.0
+
+        return amount, avg_price, last_buy_price, cost_basis
+
+    def get_last_transaction(self, trading_pair: str, tx_type: Optional[str] = None) -> Optional[Dict]:
+        """Get the most recent transaction for a trading pair, or None.
+        Pass tx_type='buy'/'sell' to filter to only that type."""
+        pair_txs = sorted(
+            (tx for tx in self.transactions
+             if tx['trading_pair'] == trading_pair and (tx_type is None or self._tx_type(tx) == tx_type)),
+            key=lambda tx: tx['date']
+        )
         return pair_txs[-1] if pair_txs else None
 
     def get_monthly_spent(self, trading_pair: str, deposit_day: int, buy_hour: int = 0) -> float:
@@ -273,6 +302,7 @@ class TransactionStore:
         pair_txs = [
             tx for tx in self.transactions
             if tx['trading_pair'] == trading_pair
+            and self._tx_type(tx) == 'buy'
             and datetime.fromisoformat(tx['date']) >= period_start
         ]
         return sum(tx['amount'] * tx['price'] for tx in pair_txs)
@@ -502,12 +532,14 @@ class KrakenDCA:
         try:
             fiat_currency = self.get_fiat_currency()
             cost = amount * price
-            self.telegram.send_message(
-                self.config.telegram_chat_id,
+            message = (
                 f"✅ {label.capitalize()} #{order_number}\n"
                 f"{amount:.8f} BTC at {price:.2f} {fiat_currency}\n"
                 f"Cost: {cost:.2f} {fiat_currency}"
             )
+            if self.config.mode == 'lump_sum' and self.config.dca_end_date:
+                message += f"\nDCA end date: {self.config.dca_end_date.strftime('%Y-%m-%d')}"
+            self.telegram.send_message(self.config.telegram_chat_id, message)
         except Exception as e:
             print(f"{Colors.YELLOW}Warning: Telegram buy notification failed: {str(e)}{Colors.RESET}")
 
@@ -647,7 +679,7 @@ class KrakenDCA:
         trading_pair = self.config.trading_pair
         fiat_currency = self.get_fiat_currency()
         total_amount, avg_price, _, total_spent = self.store.get_statistics(trading_pair)
-        last_tx = self.store.get_last_transaction(trading_pair)
+        last_tx = self.store.get_last_transaction(trading_pair, tx_type='buy')
 
         if self.config.mode == 'lump_sum':
             mode_str = f"Lump Sum (until {self.config.dca_end_date.strftime('%Y-%m-%d')})"
@@ -680,19 +712,22 @@ class KrakenDCA:
 
         try:
             current_price = self.api.get_ticker(trading_pair)
+            current_value = total_amount * current_price
+            pl_fiat = current_value - total_spent
             pl_percent = ((current_price - avg_price) / avg_price * 100) if avg_price > 0 else 0.0
             lines.append(f"Current Price: {current_price:.2f} {fiat_currency}")
-            lines.append(f"P/L: {pl_percent:+.2f}%")
+            lines.append(f"Current Value: {current_value:.2f} {fiat_currency}")
+            lines.append(f"P/L: {pl_fiat:+.2f} {fiat_currency} ({pl_percent:+.2f}%)")
         except Exception:
             pass
 
         return "\n".join(lines)
 
     def build_chart_url(self, max_points: int = 60, mode: str = 'full') -> Optional[str]:
-        """Build a QuickChart.io URL. mode='full' charts cumulative BTC held alongside
-        price; mode='price' omits BTC held and shows just the price lines. Aggregated
-        per-day (not per-transaction) to keep the chart readable and the URL short,
-        since dip/scheduled buys can produce hundreds of transactions."""
+        """Build a QuickChart.io URL. mode='full' charts cumulative BTC held and current
+        investment value alongside price; mode='price' omits those and shows just the
+        price lines. Aggregated per-day (not per-transaction) to keep the chart readable
+        and the URL short, since dip/scheduled buys can produce hundreds of transactions."""
         trading_pair = self.config.trading_pair
         pair_txs = sorted(
             (tx for tx in self.store.transactions if tx['trading_pair'] == trading_pair),
@@ -705,7 +740,8 @@ class KrakenDCA:
         for tx in pair_txs:
             day = tx['date'][:10]
             entry = daily.setdefault(day, {'amount': 0.0, 'price_sum': 0.0, 'count': 0})
-            entry['amount'] += tx['amount']
+            signed_amount = -tx['amount'] if self.store._tx_type(tx) == 'sell' else tx['amount']
+            entry['amount'] += signed_amount
             entry['price_sum'] += tx['price']
             entry['count'] += 1
 
@@ -713,10 +749,13 @@ class KrakenDCA:
         cumulative = 0.0
         cumulative_series = []
         price_series = []
+        value_series = []
         for day in days:
             cumulative += daily[day]['amount']
+            day_price = daily[day]['price_sum'] / daily[day]['count']
             cumulative_series.append(round(cumulative, 8))
-            price_series.append(round(daily[day]['price_sum'] / daily[day]['count'], 2))
+            price_series.append(round(day_price, 2))
+            value_series.append(round(cumulative * day_price, 2))
 
         if len(days) > max_points:
             step = len(days) / max_points
@@ -724,6 +763,7 @@ class KrakenDCA:
             days = [days[i] for i in indices]
             cumulative_series = [cumulative_series[i] for i in indices]
             price_series = [price_series[i] for i in indices]
+            value_series = [value_series[i] for i in indices]
 
         _, overall_avg_price, _, _ = self.store.get_statistics(trading_pair)
         fiat_currency = self.get_fiat_currency()
@@ -759,6 +799,26 @@ class KrakenDCA:
             'pointRadius': 0,
             'fill': False
         })
+        if self.config.max_price is not None:
+            datasets.append({
+                'label': f'Max Buy Price ({fiat_currency})',
+                'data': [round(self.config.max_price, 2)] * len(days),
+                'borderColor': '#f7a21a',
+                'borderDash': [3, 3],
+                'yAxisID': price_axis_id,
+                'pointRadius': 0,
+                'fill': False
+            })
+        if mode == 'full':
+            datasets.append({
+                'label': f'Investment Value ({fiat_currency})',
+                'data': value_series,
+                'borderColor': '#8e6ff7',
+                'yAxisID': 'y1',
+                'pointRadius': 0,
+                'fill': False,
+                'tension': 0.15
+            })
 
         if mode == 'full':
             y_axes = [
@@ -980,6 +1040,8 @@ class KrakenDCA:
                 poll_minutes = self.config.poll_interval_seconds // 60
 
                 print(f"{Colors.BOLD}Next scheduled buy: {Colors.CYAN}{formatted_time}{Colors.RESET}")
+                if self.config.mode == 'lump_sum' and self.config.dca_end_date:
+                    print(f"DCA end date: {Colors.CYAN}{self.config.dca_end_date.strftime('%Y-%m-%d')}{Colors.RESET}")
                 print(f"Current price: {Colors.CYAN}{current_price:.2f} {fiat_currency}{Colors.RESET}")
                 print(f"Dip buy threshold ({self.config.dip_threshold_percent}%): {Colors.CYAN}{dip_threshold:.2f} {fiat_currency}{Colors.RESET}")
                 print(f"Dip buy cooldown: {Colors.CYAN}{self.config.dip_buy_cooldown_hours}h{Colors.RESET}")
