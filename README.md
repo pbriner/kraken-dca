@@ -89,7 +89,7 @@ Edit `config.json` with your trading settings:
 - `poll_interval_seconds`: How often the bot checks price/balance (minimum 60)
 - `max_price`: Skip any buy if price is above this value. `null` to disable
 - `max_monthly_amount`: Cap fiat spend per cycle (recurring) or calendar month (lump_sum). `null` to disable
-- `telegram_bot_token` / `telegram_chat_id`: Optional — see [Telegram Integration](#-telegram-integration-optional) below
+- Telegram integration (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`): Optional, env-var only — see [Telegram Integration](#-telegram-integration-optional) below
 
 **Finding Trading Pairs:**
 Common Kraken pairs:
@@ -223,10 +223,10 @@ Query your portfolio, trigger manual buys, chart your history, and get notified 
    ```
    TELEGRAM_BOT_TOKEN=123456:ABC-your-token
    ```
-3. Restart the bot and send it any message (e.g. `/start`). Since `telegram_chat_id` isn't set yet, it will reply with your chat ID instead of any portfolio data.
-4. Add that chat ID to `config.json` (or `.env` as `TELEGRAM_CHAT_ID`):
-   ```json
-   "telegram_chat_id": "123456789"
+3. Restart the bot and send it any message (e.g. `/start`). Since `TELEGRAM_CHAT_ID` isn't set yet, it will reply with your chat ID instead of any portfolio data.
+4. Add that chat ID to `.env`:
+   ```
+   TELEGRAM_CHAT_ID=123456789
    ```
 5. Restart. The bot now only responds to that chat.
 

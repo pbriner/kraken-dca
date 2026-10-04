@@ -1,6 +1,6 @@
 {
   "_docs": {
-    "_readme": "All fields are documented here. Remove api_key and api_secret from this file — pass them via KRAKEN_API_KEY and KRAKEN_API_SECRET environment variables instead.",
+    "_readme": "All fields are documented here. Remove api_key and api_secret from this file — pass them via KRAKEN_API_KEY and KRAKEN_API_SECRET environment variables instead. Telegram integration (optional) is env-var only: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, not config.json.",
     "mode": "DCA strategy: 'recurring' (default) or 'lump_sum'. See _mode_guide below.",
     "_mode_guide": {
       "recurring": "Monthly DCA. A fixed fiat amount is deposited each month on deposit_day. The bot spreads buys evenly between each deposit. Use this when you add money regularly.",
@@ -15,9 +15,7 @@
     "dip_buy_cooldown_hours": "Minimum hours between two consecutive dip buys, to avoid over-buying during a crash.",
     "poll_interval_seconds": "How often the bot checks prices and conditions, in seconds (minimum 60).",
     "max_price": "Skip any buy if the current price is above this value (in fiat). Useful to avoid buying at ATH. Set to null to disable.",
-    "max_monthly_amount": "Maximum fiat to spend per period (deposit_day to deposit_day in recurring, or per calendar month in lump_sum). Set to null to disable.",
-    "telegram_bot_token": "Optional. Token for a Telegram bot (from @BotFather) that lets you query status and trigger manual buys. Leave empty to disable. Prefer passing via TELEGRAM_BOT_TOKEN environment variable instead of storing it here.",
-    "telegram_chat_id": "Optional. Your personal Telegram chat ID — the only chat the bot will respond to. Leave empty and message the bot once; it will reply with your chat ID to fill in here. Can also be set via TELEGRAM_CHAT_ID environment variable."
+    "max_monthly_amount": "Maximum fiat to spend per period (deposit_day to deposit_day in recurring, or per calendar month in lump_sum). Set to null to disable."
   },
    "mode": "lump_sum",
   "dca_end_date": "2026-11-10",
@@ -29,7 +27,5 @@
   "buy_hour": 8,
   "dip_buy_cooldown_hours": 0.2,
   "max_price": 55000,
-  "max_monthly_amount": 100000,
-  "telegram_bot_token": "",
-  "telegram_chat_id": "1978709615"
+  "max_monthly_amount": 100000
 }

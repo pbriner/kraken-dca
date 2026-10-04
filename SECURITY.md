@@ -200,7 +200,7 @@ If you discover a security vulnerability:
 - [ ] API key has minimal permissions (no withdrawal)
 - [ ] `.env`, `config.json`, and `transactions.json` have restricted permissions (600)
 - [ ] Kraken credentials are set via `KRAKEN_API_KEY`/`KRAKEN_API_SECRET`, not in `config.json`
-- [ ] If Telegram is enabled: `telegram_chat_id` is set (bot won't gate on an empty value), and `TELEGRAM_BOT_TOKEN` is set via env var, not `config.json`
+- [ ] If Telegram is enabled: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are both set via env vars, not `config.json` (bot won't gate on an empty chat ID)
 - [ ] Docker host is updated and patched
 - [ ] Container resource limits are set
 - [ ] Logs are monitored for suspicious activity

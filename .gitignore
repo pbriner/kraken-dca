@@ -36,6 +36,7 @@ env/
 
 # Sensitive files - IMPORTANT!
 .env
+kraken-accounting*.json
 # Uncomment these if you want to keep credentials out of git
 # config.json
 # transactions.json

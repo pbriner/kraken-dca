@@ -356,8 +356,8 @@ class Config:
         self.max_monthly_amount = float(max_monthly_raw) if max_monthly_raw is not None else None
         dca_end_raw = config.get('dca_end_date')
         self.dca_end_date = datetime.fromisoformat(dca_end_raw).astimezone() if dca_end_raw else None
-        self.telegram_bot_token = os.environ.get('TELEGRAM_BOT_TOKEN') or config.get('telegram_bot_token', '')
-        self.telegram_chat_id = str(os.environ.get('TELEGRAM_CHAT_ID') or config.get('telegram_chat_id') or '')
+        self.telegram_bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+        self.telegram_chat_id = str(os.environ.get('TELEGRAM_CHAT_ID') or '')
 
         # Validation
         if self.mode not in ('recurring', 'lump_sum'):
@@ -860,7 +860,7 @@ class KrakenDCA:
             self.telegram.send_message(
                 chat_id,
                 f"Bot not yet authorized.\nYour chat ID is: <code>{chat_id}</code>\n"
-                f"Add it to config.json as \"telegram_chat_id\" and restart to authorize this chat."
+                f"Add it to .env as TELEGRAM_CHAT_ID and restart to authorize this chat."
             )
             return
 

@@ -806,18 +806,9 @@ footer .accent { color: var(--accent); }
               <td><span class="type-tag">date or null</span></td>
               <td>ISO date string e.g. <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--green)">"2027-06-01"</code>. Required in lump_sum mode — buying stops after this date. Must be in the future.</td>
             </tr>
-            <tr>
-              <td>telegram_bot_token</td>
-              <td><span class="type-tag">string</span></td>
-              <td>Enables the Telegram integration if set. <span class="opt-tag">Optional — prefer the TELEGRAM_BOT_TOKEN environment variable over storing it here.</span></td>
-            </tr>
-            <tr>
-              <td>telegram_chat_id</td>
-              <td><span class="type-tag">string</span></td>
-              <td>The only chat the bot will respond to with real data. <span class="opt-tag">Optional — leave empty and message the bot once to have it reply with your chat ID.</span></td>
-            </tr>
           </tbody>
         </table>
+        <p style="margin-top:12px;font-size:0.9em;color:var(--muted)">Telegram integration (optional) is configured entirely via <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--accent)">TELEGRAM_BOT_TOKEN</code> and <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--accent)">TELEGRAM_CHAT_ID</code> environment variables — never in config.json. See the <a href="#telegram">Telegram</a> section below.</p>
       </div>
 
       <div class="code-block">
@@ -843,7 +834,7 @@ footer .accent { color: var(--accent); }
     <section id="telegram">
       <div class="section-label">Telegram</div>
       <h2>Query, chart, and trigger buys from Telegram</h2>
-      <p>Optional. Set <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--accent)">telegram_bot_token</code> (from <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a>) and the bot runs a long-polling listener in a background thread alongside the trading loop. Every executed buy — scheduled, dip, or manual — also sends an automatic notification with the order number, amount, price, and cost.</p>
+      <p>Optional. Set <code style="font-family:var(--font-mono);font-size:0.85em;color:var(--accent)">TELEGRAM_BOT_TOKEN</code> (from <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a>) as an environment variable and the bot runs a long-polling listener in a background thread alongside the trading loop. Every executed buy — scheduled, dip, or manual — also sends an automatic notification with the order number, amount, price, and cost.</p>
 
       <div class="modes-grid">
         <div class="mode-card highlight">
@@ -966,7 +957,7 @@ docker compose up -d --build</pre>
         <div class="sec-card">
           <h4>Credentials</h4>
           <ul class="sec-list">
-            <li>API keys — and the optional Telegram bot token — come exclusively from environment variables, never from config.json</li>
+            <li>API keys — and the optional Telegram bot token and chat ID — come exclusively from environment variables, never from config.json</li>
             <li>The .env file lives only on the production host and is never committed to git</li>
             <li>Keys are never logged or printed at any point</li>
           </ul>
